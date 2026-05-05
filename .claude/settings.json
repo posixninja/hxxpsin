@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -rf /tmp/zap-test)",
+      "Bash(/Users/posix/Desktop/hxxpsin/hxxpsin.py scan *)"
+    ]
+  }
+}

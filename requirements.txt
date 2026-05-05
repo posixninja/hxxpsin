@@ -1,0 +1,4 @@
+playwright>=1.44
+httpx[http2]>=0.27
+jsbeautifier>=1.15
+textual>=0.60.0

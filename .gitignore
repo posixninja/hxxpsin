@@ -1,0 +1,11 @@
+vm
+output
+external
+.venv
+auth.json
+session.json
+.claude 
+__pycache__
+*.pyc
+*.pyo
+*.pyd
