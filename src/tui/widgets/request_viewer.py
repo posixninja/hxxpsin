@@ -16,7 +16,10 @@ def _format_request(req: dict) -> str:
         lines.append(f"{k}: {v}")
     if body:
         lines.append("")
-        lines.append(body if len(body) < 4096 else body[:4096] + "\n[truncated]")
+        if len(body) > 16384:
+            lines.append(body[:16384] + f"\n[truncated — {len(body):,} bytes total]")
+        else:
+            lines.append(body)
     return "\n".join(lines)
 
 
@@ -36,7 +39,10 @@ def _format_response(req: dict) -> str:
         lines.append(f"{k}: {v}")
     if body:
         lines.append("")
-        lines.append(body if len(body) < 8192 else body[:8192] + "\n[truncated]")
+        if len(body) > 32768:
+            lines.append(body[:32768] + f"\n[truncated — {len(body):,} bytes total]")
+        else:
+            lines.append(body)
     return "\n".join(lines)
 
 

@@ -1,6 +1,10 @@
 """Findings tab — global findings from all probes with filter and detail."""
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -8,8 +12,44 @@ from textual.message import Message
 from textual.widgets import Button, DataTable, Input, Label, Select, Static
 
 from ..state import AppState
+from ..widgets.context_panel import ContextPanel
 from ..widgets.finding_detail import FindingDetail
 from .requests import SendToRepeater
+
+
+def _finding_key(f: dict) -> str:
+    url = f.get("url", f.get("endpoint", ""))
+    cat = f.get("category", f.get("attack", ""))
+    probe = f.get("_probe", "")
+    return hashlib.md5(f"{url}:{cat}:{probe}".encode()).hexdigest()
+
+
+def _load_confirmed_keys(state: AppState) -> set[str]:
+    if not state.out_dir:
+        return set()
+    p = Path(state.out_dir) / "confirmed.json"
+    if not p.exists():
+        return set()
+    try:
+        return set(json.loads(p.read_text()).keys())
+    except Exception:
+        return set()
+
+
+def _persist_confirmed(state: AppState, finding: dict) -> None:
+    if not state.out_dir:
+        return
+    p = Path(state.out_dir) / "confirmed.json"
+    try:
+        confirmed = json.loads(p.read_text()) if p.exists() else {}
+        confirmed[_finding_key(finding)] = {
+            "url": finding.get("url", finding.get("endpoint", "")),
+            "category": finding.get("category", finding.get("attack", "")),
+            "probe": finding.get("_probe", ""),
+        }
+        p.write_text(json.dumps(confirmed, indent=2))
+    except Exception:
+        pass
 
 
 class FindingsScreen(Horizontal):
@@ -49,6 +89,10 @@ class FindingsScreen(Horizontal):
         min-width: 12;
         margin-right: 1;
     }
+    FindingsScreen ContextPanel {
+        height: 14;
+        border-top: solid $primary;
+    }
     """
 
     def __init__(self, state: AppState, **kwargs):
@@ -66,22 +110,38 @@ class FindingsScreen(Horizontal):
             yield DataTable(id="findings-table", cursor_type="row", zebra_stripes=True)
             with Horizontal(id="action-bar"):
                 yield Button("→ Repeater", id="act-repeater", variant="primary")
-                yield Button("→ Intruder", id="act-intruder", variant="primary")
                 yield Button("Verify (LLM)", id="act-verify", variant="warning")
                 yield Button("Mark Confirmed", id="act-confirm", variant="success")
 
         with Vertical(id="findings-right"):
             yield FindingDetail(id="finding-detail")
+            yield Static("Context", classes="panel-title")
+            yield ContextPanel(self._state, id="finding-context")
 
     def on_mount(self) -> None:
         table = self.query_one("#findings-table", DataTable)
-        table.add_columns("Score", "Category", "Verdict", "Method", "URL", "Probe")
+        # Width-capped columns: long category strings (e.g. "JS Auth Pattern")
+        # were stretching the column and squeezing URL/Probe out of view.
+        table.add_column("Score",    width=6)
+        table.add_column("Category", width=16)
+        table.add_column("Verdict",  width=12)
+        table.add_column("Method",   width=7)
+        table.add_column("URL")           # absorbs remaining space
+        table.add_column("Probe",    width=10)
         self._refresh_table()
 
     def _refresh_table(self, text_filter: str = "", min_score: float = 0.0) -> None:
         table = self.query_one("#findings-table", DataTable)
         table.clear()
-        findings = self._state.findings
+        findings = list(self._state.findings)
+
+        # Patch confirmed verdicts from disk
+        confirmed_keys = _load_confirmed_keys(self._state)
+        if confirmed_keys:
+            for f in findings:
+                if _finding_key(f) in confirmed_keys:
+                    f["verdict"] = "confirmed"
+
         if text_filter:
             ft = text_filter.lower()
             findings = [
@@ -97,15 +157,25 @@ class FindingsScreen(Horizontal):
                 if float(f.get("score", f.get("confidence", 0)) or 0) >= min_score
             ]
         self._filtered = findings
+        if not findings:
+            self.query_one("#findings-table", DataTable).add_row(
+                "—", "No findings — run a scan or load an output directory", "", "", "", ""
+            )
+            return
         for f in findings:
             score = f.get("score", f.get("confidence", ""))
             score_str = f"{float(score):.2f}" if score else ""
+            url = f.get("url", f.get("endpoint", "")) or ""
+            display_url = ("…" + url[-87:]) if len(url) > 90 else url
+            cat = f.get("category", f.get("attack", "")) or ""
+            if len(cat) > 15:
+                cat = cat[:14] + "…"
             table.add_row(
                 score_str,
-                f.get("category", f.get("attack", "")),
+                cat,
                 f.get("verdict", ""),
                 f.get("method", ""),
-                (f.get("url", f.get("endpoint", "")) or "")[:60],
+                display_url,
                 f.get("_probe", ""),
             )
 
@@ -114,6 +184,7 @@ class FindingsScreen(Horizontal):
         if 0 <= idx < len(self._filtered):
             f = self._filtered[idx]
             self.query_one("#finding-detail", FindingDetail).show_finding(f)
+            self.query_one("#finding-context", ContextPanel).update_finding(f)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         text = self.query_one("#find-filter", Input).value
@@ -134,21 +205,16 @@ class FindingsScreen(Horizontal):
             url = finding.get("url", finding.get("endpoint", ""))
             method = finding.get("method", "GET")
             req = {"method": method, "url": url, "headers": {}, "body": ""}
-            self.post_message(SendToRepeater(req))
+            self.post_message(SendToRepeater(req, source="Findings"))
             self.app.notify("Sent to Repeater")
-
-        elif btn == "act-intruder" and finding:
-            url = finding.get("url", finding.get("endpoint", ""))
-            req = {"method": "GET", "url": url, "headers": {}, "body": ""}
-            self.app._send_to_intruder(req)
-            self.app.notify("Sent to Intruder")
 
         elif btn == "act-verify":
             self.app.notify("LLM verification: run pipeline with --llm-verify flag")
 
         elif btn == "act-confirm" and finding:
             finding["verdict"] = "confirmed"
-            self.app.notify("Marked as confirmed")
+            _persist_confirmed(self._state, finding)
+            self.app.notify("Marked as confirmed (saved to confirmed.json)")
             self._refresh_table()
 
     def action_send_to_repeater(self) -> None:

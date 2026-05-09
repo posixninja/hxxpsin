@@ -29,6 +29,7 @@ class EnrichmentScreen(Horizontal):
     BINDINGS = [
         Binding("r", "load_auth_repeater", "Auth → Repeater"),
         Binding("v", "reveal_secret", "Reveal"),
+        Binding("c", "copy_to_clipboard", "Copy"),
     ]
 
     DEFAULT_CSS = """
@@ -185,65 +186,83 @@ class EnrichmentScreen(Horizontal):
 
         if etype == "Users":
             table.add_columns("ID", "Score", "Emails", "Has Creds")
-            for u in self._users:
-                emails = ", ".join(u.get("emails", [])[:2])
-                table.add_row(
-                    str(u.get("canonical_id", ""))[:20],
-                    str(u.get("score", "")),
-                    emails[:40],
-                    "✓" if u.get("has_credentials") else "",
-                )
+            if not self._users:
+                table.add_row("—", "No users found in enrichment output", "", "")
+            else:
+                for u in self._users:
+                    emails = ", ".join(u.get("emails", [])[:2])
+                    table.add_row(
+                        str(u.get("canonical_id", ""))[:20],
+                        str(u.get("score", "")),
+                        emails[:40],
+                        "✓" if u.get("has_credentials") else "",
+                    )
 
         elif etype == "OAuth Apps":
             table.add_columns("Client ID", "Name", "Secret", "Redirect URIs")
-            for app in self._oauth_apps:
-                table.add_row(
-                    str(app.get("client_id", ""))[:30],
-                    str(app.get("name", "")),
-                    "✓" if app.get("client_secret_present") else "",
-                    str(len(app.get("redirect_uris", []))),
-                )
+            if not self._oauth_apps:
+                table.add_row("—", "No OAuth apps found in enrichment output", "", "")
+            else:
+                for app in self._oauth_apps:
+                    table.add_row(
+                        str(app.get("client_id", ""))[:30],
+                        str(app.get("name", "")),
+                        "✓" if app.get("client_secret_present") else "",
+                        str(len(app.get("redirect_uris", []))),
+                    )
 
         elif etype == "Hosts":
             table.add_columns("Hostname", "IPs", "Paths")
-            for h in self._hosts:
-                ips = ", ".join(h.get("ips", [])[:3])
-                table.add_row(
-                    str(h.get("hostname", "")),
-                    ips[:30],
-                    str(len(h.get("discovered_paths", []))),
-                )
+            if not self._hosts:
+                table.add_row("—", "No hosts found in enrichment output", "")
+            else:
+                for h in self._hosts:
+                    ips = ", ".join(h.get("ips", [])[:3])
+                    table.add_row(
+                        str(h.get("hostname", "")),
+                        ips[:30],
+                        str(len(h.get("discovered_paths", []))),
+                    )
 
         elif etype == "Secrets":
             table.add_columns("Type", "Entropy", "Preview", "Length")
-            for s in self._secrets:
-                table.add_row(
-                    str(s.get("type_hint", "")),
-                    str(s.get("entropy", "")),
-                    str(s.get("value_preview", ""))[:30],
-                    str(s.get("value_length", "")),
-                )
+            if not self._secrets:
+                table.add_row("—", "No secrets found in enrichment output", "", "")
+            else:
+                for s in self._secrets:
+                    table.add_row(
+                        str(s.get("type_hint", "")),
+                        str(s.get("entropy", "")),
+                        str(s.get("value_preview", ""))[:30],
+                        str(s.get("value_length", "")),
+                    )
 
         elif etype == "JS Analysis":
             js_path = None
             if self._state.out_dir:
                 js_path = Path(self._state.out_dir) / "js_analysis.json"
             table.add_columns("Type", "Value")
+            loaded = False
             if js_path and js_path.exists():
                 try:
                     js = json.loads(js_path.read_text())
                     for ep in js.get("endpoints", [])[:50]:
                         table.add_row("endpoint", str(ep.get("path", "")))
+                        loaded = True
                     for sec in js.get("secrets", [])[:20]:
                         table.add_row("secret", str(sec.get("type", "")) + ": " + str(sec.get("value", ""))[:40])
+                        loaded = True
                 except Exception:
                     pass
+            if not loaded:
+                table.add_row("—", "No JS analysis data — run a scan first")
 
         elif etype == "LLM Verdicts":
             table.add_columns("Verdict", "Category", "URL", "Reason")
             llm_path = None
             if self._state.out_dir:
                 llm_path = Path(self._state.out_dir) / "llm_verifier.json"
+            loaded = False
             if llm_path and llm_path.exists():
                 try:
                     data = json.loads(llm_path.read_text())
@@ -255,8 +274,11 @@ class EnrichmentScreen(Horizontal):
                             str(r.get("url", ""))[:40],
                             str(r.get("reason", ""))[:40],
                         )
+                        loaded = True
                 except Exception:
                     pass
+            if not loaded:
+                table.add_row("—", "No LLM verdicts — run with --llm flag", "", "")
 
     def _show_entity_detail(self, idx: int) -> None:
         etype = self._current_type
@@ -320,6 +342,39 @@ class EnrichmentScreen(Horizontal):
         if self._current_type == "Secrets" and 0 <= idx < len(self._secrets):
             value = self._secrets[idx].get("_value", "(unavailable)")
             self.query_one("#secrets-text", TextArea).load_text(value)
+
+    def action_copy_to_clipboard(self) -> None:
+        """Copy the most relevant visible text to the system clipboard."""
+        import subprocess
+        try:
+            tabs = self.query_one("#detail-tabs", TabbedContent)
+            active = tabs.active
+        except Exception:
+            active = ""
+
+        text = ""
+        try:
+            if active == "tab-secrets" or self._current_type == "Secrets":
+                text = self.query_one("#secrets-text", TextArea).text
+            elif active == "tab-auth":
+                text = self.query_one("#auth-text", TextArea).text
+            elif active == "tab-profile":
+                text = self.query_one("#profile-text", TextArea).text
+            else:
+                text = self.query_one("#auth-text", TextArea).text
+        except Exception:
+            pass
+
+        if not text or text in ("(no auth headers)", "(press v to reveal)"):
+            self.app.notify("Nothing to copy — reveal the secret first (v)", severity="warning")
+            return
+
+        try:
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+            preview = text[:40].replace("\n", " ")
+            self.app.notify(f"Copied: {preview}…" if len(text) > 40 else f"Copied: {text}")
+        except Exception as e:
+            self.app.notify(f"Clipboard error: {e}", severity="error")
 
     def refresh_data(self) -> None:
         self._load_enrichment_data()

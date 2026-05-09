@@ -168,10 +168,17 @@ class NoSQLProbe:
 
         findings: list[NoSQLFinding] = []
 
-        # Select an injectable param
-        param = next((_NOSQL_PARAM_RE.search(p).string for p in params if _NOSQL_PARAM_RE.search(p)), None)
+        # Select an injectable param.  Priority: first param whose name smells
+        # like a NoSQL field; fallback: first query param; fallback: use body.
+        param = next((p for p in params if _NOSQL_PARAM_RE.search(p)), None)
         if param is None and params:
             param = next(iter(params))
+
+        # No query params and no body → nothing to inject into; skip rather
+        # than firing synthetic {"q": payload} bodies against an endpoint that
+        # almost certainly won't interpret them.
+        if not params and not body:
+            return []
 
         results = await asyncio.gather(
             self._test_operator(client, url, method, param, params, body, baseline_status, baseline_len),

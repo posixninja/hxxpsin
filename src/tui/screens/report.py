@@ -75,6 +75,9 @@ class ReportScreen(Vertical):
                 f"No report.md found in `{out_dir}`.\n\nRun a scan first or load an output directory."
             )
 
+    def on_show(self) -> None:
+        self._load_report()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-editor":
             self.action_open_editor()

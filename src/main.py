@@ -44,7 +44,7 @@ from auth_bypass import AuthBypassProbe
 from auto_auth import AutoAuth
 from browser_verifier import BrowserVerifier
 from dom_xss_probe import DOMXSSProbe
-from file_grabber import FileGrabber
+from file_grabber import FileGrabber, FileGrabResult
 from har_import import HARImporter
 from idor_probe import IDORProbe, Account
 from canary import Canary
@@ -52,7 +52,7 @@ from challenge_tracker import ChallengeTracker
 from classifier import classify
 from collector import Collector, CapturedRequest
 from crlf_probe import CRLFProbe
-from ct_probe import CTProbe
+from ct_probe import CTProbe, CTProbeResult
 from desync_probe import DesyncProbe, urls_from_classifier
 from enricher import Enricher
 from intruder import Intruder, IntruderRequest, load_payloads
@@ -68,8 +68,8 @@ from upload_probe import UploadProbe
 from repeater import Repeater, ReplayRequest
 from reporter import Reporter
 from stackprint import Stackprint, StackProfile
-from verifier import Verifier, verify_cors, verify_js_findings
-from ws_probe import WSProbe
+from verifier import Verifier, VerifyReport, verify_cors, verify_js_findings
+from ws_probe import WSProbe, WSProbeResult
 
 
 _progress_cb = None  # set by TUI via set_progress_cb()
@@ -152,7 +152,16 @@ async def cmd_scan(args) -> None:
         return
 
     # ── 2. crawl OR HAR import ──────────────────────────────────────────
-    col = Collector(args.target)
+    # Live progress: pipe each new captured request through _progress_cb so the
+    # TUI Spider tab can stream rows into its tree/list as the crawl runs.
+    def _live_request(req_dict: dict) -> None:
+        if _progress_cb:
+            try:
+                _progress_cb("request_added", req_dict)
+            except Exception:
+                pass
+
+    col = Collector(args.target, on_request=_live_request)
     har_result, auto_auth_session = await _run_crawl_pipeline(
         args, profile, col, out, total_steps,
     )
@@ -175,6 +184,7 @@ async def cmd_scan(args) -> None:
 
 async def cmd_quick(args) -> None:
     """No browser. Stackprint + desync + enrichment. Runs in ~60 seconds."""
+    args._quick_mode = True
     start = time.monotonic()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -192,7 +202,14 @@ async def cmd_quick(args) -> None:
         return
 
     # Synthesize a minimal collector from stackprint's probe hits
-    col = Collector(args.target)
+    def _live_request(req_dict: dict) -> None:
+        if _progress_cb:
+            try:
+                _progress_cb("request_added", req_dict)
+            except Exception:
+                pass
+
+    col = Collector(args.target, on_request=_live_request)
     _seed_collector_from_profile(col, profile)
 
     # Also seed from OpenAPI spec if available
@@ -203,6 +220,66 @@ async def cmd_quick(args) -> None:
     _err(f"Seeded {len(col.requests)} endpoint stubs total")
 
     await _finish_pipeline(args, profile, col, out, start, total_steps, step_offset=1)
+
+
+# ---------------------------------------------------------------------------
+# Standalone crawl — used by the TUI Spider tab
+# ---------------------------------------------------------------------------
+
+async def run_crawl(args, on_request=None) -> "Collector":
+    """Stackprint + crawl only. Writes stackprint.json + collector.json.
+
+    on_request: optional callback(req_dict) fired for each new request — used
+    by the TUI Spider tab to stream rows into the live table.
+    """
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    _step(1, 2, f"Fingerprinting stack: {args.target}")
+    sp = Stackprint(args.target, timeout=args.timeout)
+    profile = await sp.run()
+    _err(f"Detected: {_profile_summary(profile)}")
+    (out / "stackprint.json").write_text(json.dumps(profile.to_dict(), indent=2))
+
+    if not _PLAYWRIGHT_OK:
+        _err("playwright not installed — cannot crawl")
+        col = Collector(args.target, on_request=on_request)
+        _seed_collector_from_profile(col, profile)
+    else:
+        _step(2, 2, "Crawling (Playwright)")
+        col = Collector(args.target, on_request=on_request)
+        auth_hdrs = _load_auth_headers(args)
+        cfg_cls = None
+        try:
+            from crawler import CrawlConfig as cfg_cls
+        except ImportError:
+            pass
+        if cfg_cls:
+            cfg = cfg_cls(
+                start_url=args.target,
+                auth_state=getattr(args, "auth", None),
+                max_pages=getattr(args, "max_pages", 80),
+                max_depth=getattr(args, "max_depth", 4),
+                headless=not getattr(args, "headed", False),
+                allow_writes=False,
+                extra_headers=auth_hdrs,
+                hash_routing=getattr(profile, "hash_routing", False),
+                allowed_hosts=getattr(args, "allowed_hosts", []),
+                excluded_patterns=getattr(args, "excluded_patterns", []),
+            )
+            from crawler import Crawler
+            from urllib.parse import urljoin
+            crawler = Crawler(cfg, col)
+            for path in profile.interesting_paths[:30]:
+                if crawler._is_spa_route_candidate(path):
+                    await crawler._enqueue(urljoin(args.target, path), 0)
+            await crawler.run()
+            _err(f"Pages visited: {len(crawler._visited)}")
+
+    (out / "collector.json").write_text(json.dumps(col.to_dict(), indent=2))
+    if _progress_cb:
+        _progress_cb("collector", str(out), len(col.requests))
+    return col
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +619,13 @@ async def _finish_pipeline(
 ) -> None:
     offset = step_offset
 
+    # Write collector.json now if not already written (quick mode skips the crawl step)
+    collector_path = out / "collector.json"
+    if not collector_path.exists():
+        collector_path.write_text(json.dumps(col.to_dict(), indent=2))
+        if _progress_cb:
+            _progress_cb("collector", str(out), len(col.requests))
+
     # Canary lifecycle — starts here, closed in finally
     canary = None
     oob_mode = getattr(args, "oob", None)
@@ -566,16 +650,20 @@ async def _finish_pipeline(
     # saves anything with a downloadable extension to <out>/downloads/.
     # PDFs, .kdbx, .bak, .sql, images-with-EXIF, source archives — all the
     # recon-goldmine artifacts the browser refused to render.
-    _err("[+] File grabber: collecting binary URLs from crawl + stackprint...")
-    grabber_urls: list[str] = []
-    grabber_urls.extend(r.url for r in col.requests)
-    grabber_urls.extend(urljoin(args.target, p) for p in profile.interesting_paths)
-    grabber_result = await FileGrabber(
-        out_dir=str(out),
-        max_files=200,
-        max_bytes_per_file=10 * 1024 * 1024,
-        timeout=args.timeout,
-    ).run(grabber_urls, auth_headers=_load_auth_headers(args))
+    if getattr(args, "passive", False):
+        _err("[+] File grabber: skipped (passive mode)")
+        grabber_result = FileGrabResult(out_dir=str(out / "downloads"))
+    else:
+        _err("[+] File grabber: collecting binary URLs from crawl + stackprint...")
+        grabber_urls: list[str] = []
+        grabber_urls.extend(r.url for r in col.requests)
+        grabber_urls.extend(urljoin(args.target, p) for p in profile.interesting_paths)
+        grabber_result = await FileGrabber(
+            out_dir=str(out),
+            max_files=200,
+            max_bytes_per_file=10 * 1024 * 1024,
+            timeout=args.timeout,
+        ).run(grabber_urls, auth_headers=_load_auth_headers(args))
     if grabber_result.candidates_seen:
         ext_summary = ", ".join(f"{e}:{n}" for e, n in
                                 sorted(grabber_result.by_extension().items(),
@@ -627,7 +715,12 @@ async def _finish_pipeline(
     # real browser. Runs only when both the JS analyzer found candidates
     # AND the BrowserVerifier launched successfully.
     dom_xss_result = None
-    if js_result and js_result.dom_xss and browser_verifier.available:
+    if (
+        js_result
+        and js_result.dom_xss
+        and browser_verifier.available
+        and not getattr(args, "passive", False)
+    ):
         _err(f"[+] DOM XSS verification: {len(js_result.dom_xss)} candidate(s)")
         dom_xss_result = await DOMXSSProbe(browser_verifier, timeout=args.timeout).run(
             target=args.target,
@@ -670,7 +763,7 @@ async def _finish_pipeline(
                  f"({pre_auth_session.credentials.username})")
     else:
         force_auto = getattr(args, "auto_auth", False)
-        skip_auto = getattr(args, "no_auto_auth", False)
+        skip_auto = getattr(args, "no_auto_auth", False) or getattr(args, "passive", False)
         if not skip_auto and (force_auto or not auth_hdrs):
             _err("[*] Auto-auth: provisioning fresh account...")
             js_routes = list(col._js_routes) if hasattr(col, "_js_routes") else None
@@ -697,20 +790,26 @@ async def _finish_pipeline(
     # ── JWT attack analysis ───────────────────────────────────────────────
     _step(offset + 3, total_steps, "JWT attack analysis")
     jwt_result = None
-    auth_findings = result.by_category.get("Auth/Session", [])
-    if auth_findings or result.cookie_findings:
-        jwt_result = await JWTAnalyzer(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-            canary=canary,
-        ).run(auth_findings, result.cookie_findings)
-        _err(f"JWT: {jwt_result.tokens_tested} tokens tested, "
-             f"{len(jwt_result.confirmed)} attacks confirmed")
+    if getattr(args, "passive", False):
+        _err("JWT: skipped (passive mode)")
+    else:
+        auth_findings = result.by_category.get("Auth/Session", [])
+        if auth_findings or result.cookie_findings:
+            jwt_result = await JWTAnalyzer(
+                auth_headers=auth_hdrs,
+                timeout=args.timeout,
+                canary=canary,
+                grabbed_key_files=grabber_result.grabbed,
+            ).run(auth_findings, result.cookie_findings)
+            _err(f"JWT: {jwt_result.tokens_tested} tokens tested, "
+                 f"{len(jwt_result.confirmed)} attacks confirmed")
 
     # ── hidden parameter discovery ────────────────────────────────────────
     _step(offset + 4, total_steps, "Hidden parameter discovery")
     param_result = None
-    if not getattr(args, "no_param_mine", False):
+    if getattr(args, "passive", False):
+        _err("Param miner: skipped (passive mode)")
+    elif not getattr(args, "no_param_mine", False):
         param_result = await ParamMiner(
             auth_headers=auth_hdrs,
             timeout=args.timeout,
@@ -723,24 +822,32 @@ async def _finish_pipeline(
         _err("Param miner: disabled (--no-param-mine)")
 
     # ── verify ───────────────────────────────────────────────────────────
-    _step(offset + 5, total_steps, "Verifying findings (active probes)")
-    verify_report = await Verifier(
-        result.request_findings,
-        auth_headers=auth_hdrs,
-        timeout=args.timeout,
-        origin=args.target,
-        canary=canary,
-    ).run()
+    passive = getattr(args, "passive", False)
+    if passive:
+        _step(offset + 5, total_steps, "Verify: skipped (passive mode)")
+        # Build a real (empty) VerifyReport rather than a stub so every
+        # downstream code path that touches it (subsystem counts, JSON dump,
+        # passing through to active_result.run) sees a normal object.
+        verify_report = VerifyReport(results=[])
+    else:
+        _step(offset + 5, total_steps, "Verifying findings (active probes)")
+        verify_report = await Verifier(
+            result.request_findings,
+            auth_headers=auth_hdrs,
+            timeout=args.timeout,
+            origin=args.target,
+            canary=canary,
+        ).run()
 
-    # CORS pass — deduplicated check across all discovered API URLs
-    api_urls = [f.url for f in result.request_findings]
-    cors_results = await verify_cors(api_urls, auth_hdrs, timeout=args.timeout)
-    verify_report.results.extend(cors_results)
+        # CORS pass — deduplicated check across all discovered API URLs
+        api_urls = [f.url for f in result.request_findings]
+        cors_results = await verify_cors(api_urls, auth_hdrs, timeout=args.timeout)
+        verify_report.results.extend(cors_results)
 
-    # JS secrets + source maps pass
-    if js_result is not None:
-        js_verify = await verify_js_findings(js_result, args.target, auth_hdrs, timeout=args.timeout)
-        verify_report.results.extend(js_verify)
+        # JS secrets + source maps pass
+        if js_result is not None:
+            js_verify = await verify_js_findings(js_result, args.target, auth_hdrs, timeout=args.timeout)
+            verify_report.results.extend(js_verify)
 
     # NOTE: this counts only the Verifier subsystem. Auth-bypass, active-scan,
     # IDOR, etc. each report their own confirmation totals further below.
@@ -753,15 +860,21 @@ async def _finish_pipeline(
         _err(f"      {r.evidence}")
     (out / "verify.json").write_text(json.dumps(verify_report.to_dict(), indent=2))
 
-    # ── open redirect probe (always-on) ──────────────────────────────────
+    # ── open redirect probe (scan only — skip in quick mode, no crawl data) ─
     _step(offset + 6, total_steps, "Open redirect probing")
-    redirect_result = await OpenRedirectProbe(
-        auth_headers=auth_hdrs,
-        timeout=args.timeout,
-        browser_verifier=browser_verifier,
-    ).run(result.request_findings)
-    _err(f"Open redirect: {redirect_result.endpoints_tested} endpoints tested, "
-         f"{len(redirect_result.confirmed)} confirmed")
+    redirect_result = None
+    if passive:
+        _err("Open redirect: skipped (passive mode)")
+    elif getattr(args, "har", None) or not getattr(args, "_quick_mode", False):
+        redirect_result = await OpenRedirectProbe(
+            auth_headers=auth_hdrs,
+            timeout=args.timeout,
+            browser_verifier=browser_verifier,
+        ).run(result.request_findings)
+        _err(f"Open redirect: {redirect_result.endpoints_tested} endpoints tested, "
+             f"{len(redirect_result.confirmed)} confirmed")
+    else:
+        _err("Open redirect: skipped in quick mode")
 
     # ── active injection scan (opt-in) ────────────────────────────────────
     active_result = None
@@ -849,16 +962,20 @@ async def _finish_pipeline(
 
     # ── desync probe ─────────────────────────────────────────────────────
     _step(offset + 8, total_steps, "Desync / cache / protocol probes")
-    desync_urls = urls_from_classifier(result)
-    if not desync_urls:
-        desync_urls = [args.target]
-    desync_probe = DesyncProbe(
-        desync_urls[:15],
-        profile=profile,
-        timeout=args.timeout,
-    )
-    desync_result = await desync_probe.run()
-    _err(f"Desync findings: {len(desync_result.findings)} ({len(desync_result.high())} high)")
+    desync_result = None
+    if passive:
+        _err("Desync: skipped (passive mode)")
+    else:
+        desync_urls = urls_from_classifier(result)
+        if not desync_urls:
+            desync_urls = [args.target]
+        desync_probe = DesyncProbe(
+            desync_urls[:15],
+            profile=profile,
+            timeout=args.timeout,
+        )
+        desync_result = await desync_probe.run()
+        _err(f"Desync findings: {len(desync_result.findings)} ({len(desync_result.high())} high)")
 
     # ── Auto-fuzz (opt-in: --auto-fuzz) ──────────────────────────────────
     # Runs the Intruder payload library against every discovered parameter:
@@ -885,23 +1002,30 @@ async def _finish_pipeline(
     else:
         _err("Auto-fuzz: skipped (pass --auto-fuzz to enable)")
 
-    # ── CRLF probe (always-on) ────────────────────────────────────────────
+    # ── CRLF probe (always-on, except passive mode) ──────────────────────
     _step(offset + 9, total_steps, "CRLF injection probing")
-    crlf_result = await CRLFProbe(
-        auth_headers=auth_hdrs,
-        timeout=args.timeout,
-    ).run([f.url for f in result.request_findings[:20]])
-    _err(f"CRLF: {crlf_result.urls_tested} URLs tested, {len(crlf_result.confirmed)} confirmed")
+    if passive:
+        crlf_result = None
+        _err("CRLF: skipped (passive mode)")
+    else:
+        crlf_result = await CRLFProbe(
+            auth_headers=auth_hdrs,
+            timeout=args.timeout,
+        ).run([f.url for f in result.request_findings[:20]])
+        _err(f"CRLF: {crlf_result.urls_tested} URLs tested, {len(crlf_result.confirmed)} confirmed")
 
     # ── Content-type confusion probe ─────────────────────────────────────
     # Replays XHR JSON state-change findings with text/plain and form-urlencoded
     # Content-Types. If the server returns the same 2xx, the body is processed
     # without a type check — a cross-origin HTML form can submit it without a
     # CORS preflight, bypassing CORS-as-CSRF-protection entirely.
-    ct_probe_result = await CTProbe(
-        auth_headers=auth_hdrs,
-        timeout=args.timeout,
-    ).run(result.request_findings)
+    if passive:
+        ct_probe_result = CTProbeResult()
+    else:
+        ct_probe_result = await CTProbe(
+            auth_headers=auth_hdrs,
+            timeout=args.timeout,
+        ).run(result.request_findings)
     if ct_probe_result.endpoints_tested:
         _err(
             f"CT confusion: {ct_probe_result.endpoints_tested} endpoints tested, "
@@ -921,21 +1045,24 @@ async def _finish_pipeline(
     # Then actively test each one: CSWSH (spoofed Origin), unauthenticated
     # access (no auth headers), null-origin, and subscription/channel IDOR.
     ws_probe_result = None
-    ws_urls: list[str] = [ws.url for ws in col.websockets]
-    if js_result:
-        ws_urls.extend(js_result.websocket_urls)
-    ws_urls.extend(getattr(profile, "websocket_urls", []))
-    ws_probe_result = await WSProbe(
-        auth_headers=auth_hdrs,
-        timeout=args.timeout,
-    ).run(
-        ws_urls=ws_urls,
-        captured_websockets=col.websockets,
-        # Always probe the target origin for Socket.io even when no WS URL
-        # was passively captured (chatbot / real-time features that only fire
-        # after user interaction won't show up in the passive crawler results).
-        http_origins=[args.target],
-    )
+    if passive:
+        ws_probe_result = WSProbeResult()
+    else:
+        ws_urls: list[str] = [ws.url for ws in col.websockets]
+        if js_result:
+            ws_urls.extend(js_result.websocket_urls)
+        ws_urls.extend(getattr(profile, "websocket_urls", []))
+        ws_probe_result = await WSProbe(
+            auth_headers=auth_hdrs,
+            timeout=args.timeout,
+        ).run(
+            ws_urls=ws_urls,
+            captured_websockets=col.websockets,
+            # Always probe the target origin for Socket.io even when no WS URL
+            # was passively captured (chatbot / real-time features that only fire
+            # after user interaction won't show up in the passive crawler results).
+            http_origins=[args.target],
+        )
     if ws_probe_result.urls_tested:
         _err(
             f"WS probe: {len(ws_probe_result.urls_tested)} URLs tested, "
@@ -956,7 +1083,7 @@ async def _finish_pipeline(
     # for offline analysis — this is the "go back and download what we
     # couldn't access before" pass.
     access_replay_result = None
-    if not getattr(args, "no_access_replay", False):
+    if not getattr(args, "no_access_replay", False) and not getattr(args, "passive", False):
         bypass_tokens: list[BypassToken] = []
         bypass_tokens.extend(tokens_from_jwt_attack(jwt_result, baseline_headers=auth_hdrs))
         bypass_tokens.extend(tokens_from_auth_bypass(auth_bypass_result, baseline_headers=auth_hdrs))

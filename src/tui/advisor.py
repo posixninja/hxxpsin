@@ -89,10 +89,19 @@ def _rules(req: dict, state: AppState) -> list[tuple[str, str, float, str]]:
     status = _response_status(req)
     hdrs = {k.lower(): v for k, v in _headers(req).items()}
     stack = _stack(state)
+    resource_type = req.get("resource_type", "")
 
     parsed = urlparse(url)
     path = parsed.path or "/"
     qs = parsed.query or ""
+
+    # Static assets have no meaningful attack surface — skip all injection rules
+    _STATIC = frozenset({"image", "font", "stylesheet", "media"})
+    if resource_type in _STATIC:
+        return fired
+
+    # Only compute "has params" flag once — used to gate injection-only rules
+    _has_params = bool(qs) or bool(body)
 
     # ── IDOR ────────────────────────────────────────────────────────────
     if _ID_PATH_RE.search(path):
@@ -118,20 +127,20 @@ def _rules(req: dict, state: AppState) -> list[tuple[str, str, float, str]]:
         fired.append(("active", "Auth bypass", 0.6, f"{status} response — may be bypassable"))
 
     # ── SQL injection ────────────────────────────────────────────────────
-    if method == "POST" and ("application/json" in hdrs.get("content-type", "") or body):
+    if method == "POST" and _has_params:
         fired.append(("active", "SQLi (active scan)", 0.5, "POST with body — injectable fields"))
     if _SQL_ERROR_RE.search(resp_body):
         fired.append(("active", "SQLi (active scan)", 0.85, "SQL error string in response"))
     langs = stack.get("language", [])
-    if any(l in ("PHP", "Java") for l in langs):
-        fired.append(("active", "SQLi (active scan)", 0.3, f"{'/'.join(langs)} stack — historically SQLi-prone"))
+    if _has_params and any(l in ("PHP", "Java") for l in langs):
+        fired.append(("active", "SQLi (active scan)", 0.3, f"{'/'.join(langs)} stack — injectable params present"))
 
     # ── NoSQL ────────────────────────────────────────────────────────────
     dbs = stack.get("database", [])
-    if any("mongo" in d.lower() for d in dbs):
-        fired.append(("nosql", "NoSQL probe", 0.8, "MongoDB detected in stackprint"))
-    if any("express" in f.lower() for f in stack.get("framework", [])):
-        fired.append(("nosql", "NoSQL probe", 0.4, "Express.js — often paired with MongoDB"))
+    if any("mongo" in d.lower() for d in dbs) and _has_params:
+        fired.append(("nosql", "NoSQL probe", 0.8, "MongoDB + injectable params"))
+    if _has_params and any("express" in f.lower() for f in stack.get("framework", [])):
+        fired.append(("nosql", "NoSQL probe", 0.4, "Express.js with injectable params"))
 
     # ── BFLA / admin ────────────────────────────────────────────────────
     if _ADMIN_PATH_RE.search(path):
@@ -148,41 +157,50 @@ def _rules(req: dict, state: AppState) -> list[tuple[str, str, float, str]]:
     # ── Open redirect ────────────────────────────────────────────────────
     if _REDIRECT_PARAM_RE.search(url):
         fired.append(("active", "Open redirect", 0.8, "redirect parameter in URL"))
-    if status in (301, 302, 307, 308):
-        fired.append(("active", "Open redirect", 0.5, f"{status} redirect response"))
+    if status in (301, 302, 307, 308) and _REDIRECT_PARAM_RE.search(url):
+        fired.append(("active", "Open redirect", 0.5, f"{status} + redirect param"))
 
     # ── CRLF ────────────────────────────────────────────────────────────
-    if qs:
-        fired.append(("crlf", "CRLF probe", 0.4, "URL has query parameters"))
-    if method == "GET" and _CRLF_PARAM_RE.search(url):
-        fired.append(("crlf", "CRLF probe", 0.3, "multiple query params — injection surface"))
+    if _has_params and _CRLF_PARAM_RE.search(url):
+        fired.append(("crlf", "CRLF probe", 0.5, "injectable query parameters"))
 
     # ── Desync ──────────────────────────────────────────────────────────
-    servers = stack.get("server", [])
-    if any(s in ("nginx", "Apache", "HAProxy", "Varnish") for s in servers):
-        fired.append(("desync", "Desync probe", 0.5, f"{'/'.join(servers[:2])} — desync-prone server"))
-    if "transfer-encoding" in hdrs or "content-length" in hdrs:
-        fired.append(("desync", "Desync probe", 0.35, "CL/TE headers present"))
-
-    # ── Param miner ──────────────────────────────────────────────────────
-    if method == "GET" and not qs:
-        fired.append(("param", "Param miner", 0.5, "GET endpoint with no params — hidden params likely"))
-    if _ADMIN_PATH_RE.search(path):
-        fired.append(("param", "Param miner", 0.4, "admin path — debug/internal params worth mining"))
+    # Only suggest when concrete request-level signals exist, not just server presence
+    if "transfer-encoding" in hdrs and "content-length" in hdrs:
+        fired.append(("desync", "Desync probe", 0.8, "both CL and TE headers present"))
+    elif method == "POST" and "transfer-encoding" in hdrs:
+        fired.append(("desync", "Desync probe", 0.6, "POST with Transfer-Encoding"))
+    elif method == "POST" and any(s in ("HAProxy", "Varnish") for s in stack.get("server", [])):
+        fired.append(("desync", "Desync probe", 0.4, "POST through desync-prone proxy"))
 
     # ── GraphQL ──────────────────────────────────────────────────────────
     if _GRAPHQL_RE.search(path) or "application/graphql" in hdrs.get("content-type", ""):
         fired.append(("active", "GraphQL introspection", 0.9, "GraphQL endpoint detected"))
 
     # ── WebSocket ────────────────────────────────────────────────────────
-    if state.probe_results.get("ws") or any(
-        "websocket" in str(r).lower() for r in state.requests[:5]
+    if (
+        resource_type == "websocket"
+        or url.startswith(("ws://", "wss://"))
+        or "websocket" in hdrs.get("upgrade", "").lower()
+        or state.probe_results.get("ws")
+        or any("websocket" in str(r).lower() for r in state.requests[:5])
     ):
-        fired.append(("ws", "WebSocket probe", 0.5, "WebSocket traffic observed"))
+        fired.append(("ws", "WebSocket probe", 0.9, "WebSocket endpoint"))
 
     # ── Enrichment ───────────────────────────────────────────────────────
     if resp_body and any(k in resp_body.lower() for k in ("email", "password", "token", "secret", "user")):
         fired.append(("enrichment", "Enrichment", 0.7, "response contains identity/credential fields"))
+
+    # ── JS analysis ──────────────────────────────────────────────────────
+    if resource_type == "script" or (not resource_type and path.endswith((".js", ".ts", ".mjs"))):
+        fired.append(("js", "JS analysis", 0.95,
+                      "JavaScript file — scan for endpoints, secrets, DOM XSS"))
+
+    # ── Fingerprint ──────────────────────────────────────────────────────
+    # Suggest on document, API, or untyped requests — skip images/fonts/stylesheets
+    if resource_type in ("document", "xhr", "fetch", ""):
+        fired.append(("fingerprint", "Tech fingerprint", 0.5,
+                      "Detect server stack, frameworks, CDN, risk flags"))
 
     return fired
 

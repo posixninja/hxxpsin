@@ -310,14 +310,19 @@ class UploadProbe:
             for url in targets:
                 ep_dir = self.out_root / self._slug(url)
                 ep_dir.mkdir(parents=True, exist_ok=True)
-                # First — fingerprint the form by trying each common field name
-                # against the simplest test, to learn which field the server
-                # accepts. Reuse that field name for the rest of the suite.
-                field_name = await self._fingerprint_field(client, url, ep_dir)
+                # Fingerprint: find the right field name AND establish whether
+                # the server accepts a totally benign file (plain text).  If it
+                # does, any later "accepted" verdict is low-signal — the server
+                # takes everything.  If it doesn't, a 2xx from a bypass test is
+                # actually meaningful.
+                field_name, baseline_accepts_benign = await self._fingerprint_field(client, url, ep_dir)
                 if not field_name:
                     field_name = "file"  # blind attempt
                 for t in suite:
-                    finding = await self._run_test(client, url, field_name, t, ep_dir)
+                    finding = await self._run_test(
+                        client, url, field_name, t, ep_dir,
+                        baseline_accepts_benign=baseline_accepts_benign,
+                    )
                     result.findings.append(finding)
                     result.tests_sent += 1
         return result
@@ -347,10 +352,18 @@ class UploadProbe:
                 break
         return urls
 
-    async def _fingerprint_field(self, client: httpx.AsyncClient, url: str,
-                                 ep_dir: Path) -> str:
-        """Try a tiny harmless probe with each common field name. The first
-        one that returns 2xx is presumed to be the right field."""
+    async def _fingerprint_field(
+        self, client: httpx.AsyncClient, url: str, ep_dir: Path,
+    ) -> tuple[str, bool]:
+        """Try a tiny harmless plain-text probe with each common field name.
+
+        Returns (field_name, baseline_accepts_benign):
+          field_name           — the field the server accepted, or "" if none did
+          baseline_accepts_benign — True when the server returned 2xx for a
+                                    plain text file.  Used downstream to lower
+                                    confidence on "accepted" verdicts when the
+                                    server takes everything without validation.
+        """
         probe_body = b"hxxpsin_field_probe_" + hashlib.sha256(b"x").hexdigest()[:8].encode()
         for fname in _FIELD_NAMES:
             files = {fname: ("probe.txt", probe_body, "text/plain")}
@@ -358,17 +371,20 @@ class UploadProbe:
                 r = await client.post(url, files=files)
             except Exception:
                 continue
-            if r.status_code in self._ACCEPT_STATUSES:
-                (ep_dir / "_fingerprint.json").write_text(json.dumps({
-                    "field_name": fname, "status": r.status_code,
-                    "response_snippet": r.text[:300],
-                }, indent=2))
-                return fname
-        return ""
+            accepted = r.status_code in self._ACCEPT_STATUSES
+            (ep_dir / "_fingerprint.json").write_text(json.dumps({
+                "field_name": fname, "status": r.status_code,
+                "baseline_accepts_benign": accepted,
+                "response_snippet": r.text[:300],
+            }, indent=2))
+            if accepted:
+                return fname, True
+        return "", False
 
     async def _run_test(self, client: httpx.AsyncClient, url: str,
                         field_name: str, test: UploadTest,
-                        ep_dir: Path) -> UploadFinding:
+                        ep_dir: Path, *,
+                        baseline_accepts_benign: bool = False) -> UploadFinding:
         # Save the artifact we're sending, so the operator can replay
         artifact_path = ep_dir / f"{test.name}__{self._safe_filename(test.filename)}"
         try:
@@ -434,9 +450,23 @@ class UploadProbe:
             confidence = 0.95
             evidence = f"Execution marker {marker!r} found in response — server accepted AND processed/served the payload."
         elif r.status_code in self._ACCEPT_STATUSES:
-            verdict = "accepted"
-            confidence = 0.6
-            evidence = f"Server returned {r.status_code} — file accepted, but no execution evidence."
+            if baseline_accepts_benign:
+                # Server takes everything including plain text — acceptance is
+                # not a bypass signal, just an observation.
+                verdict = "accepted"
+                confidence = 0.3
+                evidence = (
+                    f"Server returned {r.status_code} — file accepted, but server also "
+                    f"accepts benign plain-text files (no validation detected)."
+                )
+            else:
+                # Baseline plain-text was rejected; this test getting through = bypass.
+                verdict = "likely"
+                confidence = 0.75
+                evidence = (
+                    f"Server returned {r.status_code} for {test.description} but rejected "
+                    f"a benign plain-text probe — possible upload restriction bypass."
+                )
         elif r.status_code in (415, 422, 400):
             verdict = "rejected"
             confidence = 0.0

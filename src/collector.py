@@ -108,8 +108,9 @@ class CapturedWebSocket:
 
 
 class Collector:
-    def __init__(self, origin: str):
+    def __init__(self, origin: str, on_request=None):
         self.origin = origin
+        self._on_request = on_request  # optional callback(req_dict) fired on each new request
         self._requests: list[CapturedRequest] = []
         self._response_meta: dict[str, dict] = {}   # url -> {status, headers}
         self._cookies: list[CapturedCookie] = []
@@ -131,6 +132,11 @@ class Collector:
             return
         self._seen_req_keys.add(key)
         self._requests.append(req)
+        if self._on_request:
+            try:
+                self._on_request(self._req_to_dict(req))
+            except Exception:
+                pass
 
     def add_response_meta(self, url: str, status: int, headers: dict,
                           body: Optional[str] = None) -> None:

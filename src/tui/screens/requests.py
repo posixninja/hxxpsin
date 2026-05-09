@@ -7,11 +7,11 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import Button, DataTable, Input, Label, Static
-from textual import on
+from textual.widgets import Button, DataTable, Input, Label, Static, TabbedContent, TabPane
 
 from ..state import AppState
-from ..advisor import suggest
+from ..widgets.context_panel import ContextPanel
+from ..widgets.params_panel import ParamsPanel
 from ..widgets.request_viewer import RequestViewer
 
 _PROBE_BADGES = {
@@ -28,9 +28,10 @@ _PROBE_BADGES = {
 
 
 class SendToRepeater(Message):
-    def __init__(self, req: dict) -> None:
+    def __init__(self, req: dict, source: str = "") -> None:
         super().__init__()
         self.req = req
+        self.source = source
 
 
 class RequestsScreen(Horizontal):
@@ -59,6 +60,12 @@ class RequestsScreen(Horizontal):
         background: $surface;
         padding: 0 1;
     }
+    RequestsScreen #req-count {
+        width: auto;
+        content-align: right middle;
+        color: $text-muted;
+        padding: 0 1;
+    }
     RequestsScreen DataTable {
         height: 1fr;
     }
@@ -71,44 +78,42 @@ class RequestsScreen(Horizontal):
         min-width: 8;
         margin-right: 1;
     }
-    RequestsScreen #suggestions-panel {
-        height: 6;
+    RequestsScreen #right-tabs {
+        height: 16;
         border-top: solid $primary;
-        background: $surface-darken-1;
-        padding: 0 1;
-        overflow-y: auto;
     }
-    RequestsScreen .suggestion-high { color: $error; }
-    RequestsScreen .suggestion-med  { color: $warning; }
-    RequestsScreen .suggestion-low  { color: $text-muted; }
+    RequestsScreen ParamsPanel {
+        height: 1fr;
+    }
+    RequestsScreen ContextPanel {
+        height: 1fr;
+    }
     """
 
     def __init__(self, state: AppState, **kwargs):
         super().__init__(**kwargs)
         self._state = state
         self._filtered: list[dict] = []
-        self._selected_idx: set[int] = set()
+        self._selected_reqs: set[int] = set()  # id(req) for identity-based tracking
 
     def compose(self) -> ComposeResult:
         with Vertical(id="left-panel"):
             with Horizontal(id="filter-bar"):
                 yield Label("Filter: ")
                 yield Input(placeholder="url / method / status", id="filter-input")
+                yield Label("", id="req-count")
             yield DataTable(id="req-table", cursor_type="row", zebra_stripes=True)
             with Horizontal(id="action-bar"):
-                yield Button("Classify", id="act-classify", variant="default")
-                yield Button("IDOR", id="act-idor", variant="warning")
-                yield Button("JWT", id="act-jwt", variant="warning")
-                yield Button("SQLi", id="act-sqli", variant="warning")
-                yield Button("CRLF", id="act-crlf", variant="warning")
-                yield Button("Param", id="act-param", variant="default")
                 yield Button("→ Repeater", id="act-repeater", variant="primary")
                 yield Button("→ Intruder", id="act-intruder", variant="primary")
 
         with Vertical(id="right-panel"):
             yield RequestViewer(id="req-viewer")
-            yield Static("Suggestions", classes="panel-title")
-            yield Vertical(id="suggestions-panel")
+            with TabbedContent(id="right-tabs"):
+                with TabPane("Context", id="rtab-context"):
+                    yield ContextPanel(self._state, id="req-context")
+                with TabPane("Parameters", id="rtab-params"):
+                    yield ParamsPanel(id="req-params")
 
     def on_mount(self) -> None:
         table = self.query_one("#req-table", DataTable)
@@ -134,6 +139,17 @@ class RequestsScreen(Horizontal):
                     or ft in r.get("method", "").lower()
                     or ft in str(r.get("response_status", "") or r.get("response", {}).get("status", ""))]
         self._filtered = reqs
+        try:
+            self.query_one("#req-count", Label).update(
+                f"{len(reqs)}/{len(self._state.requests)}"
+            )
+        except Exception:
+            pass
+        if not reqs:
+            msg = ("No requests match filter" if filter_text
+                   else "No requests — load an output dir (Target tab) or run the Spider")
+            table.add_row("—", msg, "", "", "", "")
+            return
         for i, req in enumerate(reqs):
             method = req.get("method", "?")
             url = req.get("url", "")
@@ -150,27 +166,8 @@ class RequestsScreen(Horizontal):
         if 0 <= idx < len(self._filtered):
             req = self._filtered[idx]
             self.query_one("#req-viewer", RequestViewer).show_request(req)
-            self._update_suggestions(req)
-
-    def _update_suggestions(self, req: dict) -> None:
-        panel = self.query_one("#suggestions-panel", Vertical)
-        panel.remove_children()
-        suggestions = suggest(req, self._state)
-        if not suggestions:
-            panel.mount(Static("No high-confidence suggestions for this request.", classes="suggestion-low"))
-            return
-        for s in suggestions[:6]:
-            if s.confidence >= 0.7:
-                css_class = "suggestion-high"
-            elif s.confidence >= 0.5:
-                css_class = "suggestion-med"
-            else:
-                css_class = "suggestion-low"
-            reasons = " · ".join(s.reasons)
-            panel.mount(Static(
-                f"{s.confidence_bar} {s.label:<22} {reasons}",
-                classes=css_class,
-            ))
+            self.query_one("#req-context", ContextPanel).update_entity(req)
+            self.query_one("#req-params", ParamsPanel).update_request(req)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "filter-input":
@@ -182,7 +179,7 @@ class RequestsScreen(Horizontal):
 
         if btn == "act-repeater":
             for req in sel:
-                self.post_message(SendToRepeater(req))
+                self.post_message(SendToRepeater(req, source="Requests"))
             if sel:
                 self.app.notify(f"Sent {len(sel)} request(s) to Repeater")
 
@@ -191,27 +188,12 @@ class RequestsScreen(Horizontal):
                 self.app._send_to_intruder(sel[0])
                 self.app.notify("Sent to Intruder")
 
-        elif btn in ("act-classify", "act-idor", "act-jwt", "act-sqli",
-                     "act-crlf", "act-param"):
-            probe_map = {
-                "act-classify": "classify",
-                "act-idor": "idor",
-                "act-jwt": "jwt",
-                "act-sqli": "sqli",
-                "act-crlf": "crlf",
-                "act-param": "param",
-            }
-            probe = probe_map.get(btn, btn)
-            self.app.notify(
-                f"Running {probe} on {len(sel)} request(s)... (manual probe API coming soon)"
-            )
 
     def _get_selection(self) -> list[dict]:
         table = self.query_one("#req-table", DataTable)
         idx = table.cursor_row
-        if self._selected_idx:
-            return [self._filtered[i] for i in sorted(self._selected_idx)
-                    if i < len(self._filtered)]
+        if self._selected_reqs:
+            return [r for r in self._filtered if id(r) in self._selected_reqs]
         if 0 <= idx < len(self._filtered):
             return [self._filtered[idx]]
         return []
@@ -231,11 +213,16 @@ class RequestsScreen(Horizontal):
     def action_toggle_select(self) -> None:
         table = self.query_one("#req-table", DataTable)
         idx = table.cursor_row
-        if idx in self._selected_idx:
-            self._selected_idx.discard(idx)
-        else:
-            self._selected_idx.add(idx)
-        self._state.selected_requests = list(self._selected_idx)
+        if 0 <= idx < len(self._filtered):
+            req = self._filtered[idx]
+            rid = id(req)
+            if rid in self._selected_reqs:
+                self._selected_reqs.discard(rid)
+            else:
+                self._selected_reqs.add(rid)
+            self._state.selected_requests = [
+                r for r in self._filtered if id(r) in self._selected_reqs
+            ]
 
     def action_focus_filter(self) -> None:
         self.query_one("#filter-input", Input).focus()

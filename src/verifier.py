@@ -384,7 +384,8 @@ class Verifier:
             )
 
         original_id = int(id_match.group(1))
-        baseline_len = len(resp.content)
+        baseline_body = resp.content
+        baseline_len = len(baseline_body)
         hits: list[int] = []
 
         for delta in (1, -1, 2, 10, 100):
@@ -393,22 +394,29 @@ class Verifier:
                 continue
             adj_url = url.replace(f"/{original_id}", f"/{adj_id}", 1)
             adj = await self._get(client, adj_url)
-            if adj and adj.status_code == 200 and len(adj.content) > 30:
-                # Different non-empty body from a different ID = data leaking
-                if abs(len(adj.content) - baseline_len) < baseline_len * 2:
-                    hits.append(adj_id)
+            if adj is None or adj.status_code != 200 or len(adj.content) < 30:
+                continue
+            # Body must differ from baseline — identical bodies mean the server
+            # returns the same generic response for any ID (not a data leak).
+            if adj.content == baseline_body:
+                continue
+            # Reject if the adjacent response looks like a soft-404 / error page
+            # (much smaller than baseline or contains error patterns).
+            if self._looks_like_soft404(adj):
+                continue
+            hits.append(adj_id)
             if len(hits) >= 2:
                 break
 
         if hits:
             return self._confirmed(
                 finding,
-                f"ID enumeration: IDs {hits} also return 200 with data ({baseline_len}B baseline)",
+                f"ID enumeration: IDs {hits} return 200 with distinct data ({baseline_len}B baseline)",
                 resp, url,
             )
         return self._likely(
             finding,
-            f"endpoint returns 200 ({baseline_len}B) — adjacent IDs returned no data",
+            f"endpoint returns 200 ({baseline_len}B) — adjacent IDs returned no distinct data",
             resp, url,
         )
 

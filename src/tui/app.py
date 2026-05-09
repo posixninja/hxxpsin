@@ -1,35 +1,33 @@
 """HxxpsinApp — main Textual application."""
 from __future__ import annotations
 
+from typing import Any
+
 import asyncio
 import sys
 import types
-from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.message import Message
-from textual.screen import ModalScreen
 from textual.widgets import (
-    Button, Checkbox, DataTable, Footer, Header, Input, Label, ListItem,
-    ListView, ProgressBar, RichLog, Static, TabbedContent, TabPane,
+    Footer, Header, Label, ProgressBar, Static, TabbedContent, TabPane,
 )
 from textual import work
 
 from .state import AppState
-from .screens.target import TargetScreen
-from .screens.requests import RequestsScreen, SendToRepeater
-from .screens.endpoints import EndpointsScreen
+from .screens.dashboard import DashboardScreen
+from .screens.spider import SpiderScreen, SendToRepeater
 from .screens.findings import FindingsScreen
 from .screens.enrichment import EnrichmentScreen, LoadAuthIntoRepeater
 from .screens.repeater import RepeaterScreen
 from .screens.intruder import IntruderScreen
 from .screens.probes import ProbesScreen
 from .screens.report import ReportScreen
+from .widgets.context_panel import ContextPanel
+from .widgets.params_panel import ParamsPanel
 
 
 _PROBE_STEPS = [
@@ -47,209 +45,6 @@ _PROBE_STEPS = [
     ("upload",        "Upload probe"),
     ("access_replay", "Access replay"),
 ]
-
-
-# ---------------------------------------------------------------------------
-# New Target Modal
-# ---------------------------------------------------------------------------
-
-class NewTargetModal(ModalScreen):
-    """Modal for configuring and launching a new scan target."""
-
-    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
-
-    DEFAULT_CSS = """
-    NewTargetModal {
-        align: center middle;
-    }
-    NewTargetModal #modal-box {
-        width: 74;
-        height: 90%;
-        border: solid $primary;
-        background: $surface;
-        layout: vertical;
-    }
-    NewTargetModal #modal-title {
-        background: $primary-darken-2;
-        padding: 0 2;
-        height: 1;
-    }
-    NewTargetModal #modal-scroll {
-        height: 1fr;
-        padding: 0 2;
-    }
-    NewTargetModal .field-label {
-        color: $text-muted;
-        margin-top: 1;
-    }
-    NewTargetModal #modal-actions {
-        height: 5;
-        padding: 1 2;
-        background: $surface-darken-1;
-        border-top: solid $primary;
-    }
-    NewTargetModal #modal-actions Button {
-        margin-right: 1;
-    }
-    NewTargetModal Checkbox {
-        margin-top: 1;
-    }
-    NewTargetModal #scope-note {
-        color: $text-muted;
-        margin-top: 1;
-        margin-bottom: 1;
-    }
-    """
-
-    def __init__(self, state: AppState, **kwargs):
-        super().__init__(**kwargs)
-        self._state = state
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="modal-box"):
-            yield Static("New Target", id="modal-title")
-
-            with ScrollableContainer(id="modal-scroll"):
-                yield Static("Target URL *", classes="field-label")
-                yield Input(
-                    value=self._state.target or "",
-                    placeholder="https://target.com",
-                    id="new-target-url",
-                )
-
-                yield Static("In-scope hosts (comma-separated, beyond the primary host)", classes="field-label")
-                yield Input(
-                    value=", ".join(self._state.allowed_hosts),
-                    placeholder="api.target.com, cdn.target.com",
-                    id="new-allowed-hosts",
-                )
-
-                yield Static("Excluded URL patterns (regex, comma-separated)", classes="field-label")
-                yield Input(
-                    value=", ".join(self._state.excluded_patterns),
-                    placeholder=r"/logout, /static/, \.png$",
-                    id="new-excluded-patterns",
-                )
-
-                yield Static("Output directory (leave blank for auto)", classes="field-label")
-                yield Input(
-                    value="",
-                    placeholder="output/my-scan  (auto: output/<host>-<timestamp>)",
-                    id="new-out-dir",
-                )
-
-                yield Static("Auth (path to auth.json storage state, or blank for auto-auth)", classes="field-label")
-                yield Input(value="", placeholder="auth.json", id="new-auth")
-
-                yield Checkbox("Active scan (--active-scan)", id="chk-active", value=False)
-                yield Checkbox("Auto-fuzz (--auto-fuzz)", id="chk-autofuzz", value=False)
-                yield Checkbox("Quick mode (no browser crawl)", id="chk-quick", value=False)
-                yield Checkbox("Allow writes (PUT/DELETE clicks)", id="chk-writes", value=False)
-
-                yield Static(
-                    "Scope note: the primary host is always in scope. "
-                    "Extra hosts and exclude patterns are applied to the crawler.",
-                    id="scope-note",
-                )
-
-            with Horizontal(id="modal-actions"):
-                yield Button("Add to List", id="btn-add", variant="primary")
-                yield Button("Add + Launch", id="btn-launch", variant="success")
-                yield Button("Cancel", id="btn-cancel", variant="default")
-
-    def _build_config(self) -> dict | None:
-        url = self.query_one("#new-target-url", Input).value.strip()
-        if not url:
-            self.app.notify("Target URL is required", severity="error")
-            return None
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-
-        allowed_raw = self.query_one("#new-allowed-hosts", Input).value.strip()
-        excluded_raw = self.query_one("#new-excluded-patterns", Input).value.strip()
-        out_dir = self.query_one("#new-out-dir", Input).value.strip()
-        auth = self.query_one("#new-auth", Input).value.strip()
-
-        if not out_dir:
-            host = (urlparse(url).hostname or "target").replace(":", "_")
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            out_dir = str(Path(__file__).resolve().parents[2] / "output" / f"{host}-{ts}")
-
-        return {
-            "target": url,
-            "allowed_hosts": [h.strip() for h in allowed_raw.split(",") if h.strip()],
-            "excluded_patterns": [p.strip() for p in excluded_raw.split(",") if p.strip()],
-            "out": out_dir,
-            "auth": auth or None,
-            "active_scan": self.query_one("#chk-active", Checkbox).value,
-            "auto_fuzz": self.query_one("#chk-autofuzz", Checkbox).value,
-            "quick": self.query_one("#chk-quick", Checkbox).value,
-            "allow_writes": self.query_one("#chk-writes", Checkbox).value,
-        }
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn-cancel":
-            self.dismiss(None)
-            return
-
-        config = self._build_config()
-        if config is None:
-            return
-
-        # "add-only" returns config with launch=False; "add+launch" sets launch=True
-        config["launch"] = (event.button.id == "btn-launch")
-        self.dismiss(config)
-
-
-# ---------------------------------------------------------------------------
-# Step runner modal
-# ---------------------------------------------------------------------------
-
-class StepRunnerModal(ModalScreen):
-    """Modal overlay showing all pipeline steps and their status."""
-
-    BINDINGS = [Binding("escape", "dismiss", "Close")]
-
-    DEFAULT_CSS = """
-    StepRunnerModal {
-        align: center middle;
-    }
-    StepRunnerModal #modal-box {
-        width: 70;
-        height: 30;
-        border: solid $primary;
-        background: $surface;
-        padding: 1 2;
-    }
-    StepRunnerModal #step-table {
-        height: 1fr;
-    }
-    StepRunnerModal #modal-close {
-        margin-top: 1;
-        width: 12;
-    }
-    """
-
-    def __init__(self, state: AppState, **kwargs):
-        super().__init__(**kwargs)
-        self._state = state
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="modal-box"):
-            yield Static("Step Runner  (Esc to close)")
-            yield DataTable(id="step-table", cursor_type="row")
-            yield Button("Close", id="modal-close", variant="default")
-
-    def on_mount(self) -> None:
-        table = self.query_one("#step-table", DataTable)
-        table.add_columns("Step", "Status")
-        for key, label in _PROBE_STEPS:
-            status = self._state.probe_status.get(key, "○ not run")
-            table.add_row(label, status)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "modal-close":
-            self.dismiss()
 
 
 # ---------------------------------------------------------------------------
@@ -335,52 +130,6 @@ class AlertsBar(Horizontal):
 
 
 # ---------------------------------------------------------------------------
-# Scan progress overlay
-# ---------------------------------------------------------------------------
-
-class ScanProgressOverlay(ModalScreen):
-    """Non-blocking overlay showing live scan progress log."""
-
-    BINDINGS = [Binding("escape", "dismiss", "Hide (scan continues)")]
-
-    DEFAULT_CSS = """
-    ScanProgressOverlay {
-        align: center middle;
-    }
-    ScanProgressOverlay #overlay-box {
-        width: 80;
-        height: 24;
-        border: solid $success;
-        background: $surface;
-        padding: 1 2;
-    }
-    ScanProgressOverlay RichLog {
-        height: 1fr;
-        border: none;
-    }
-    ScanProgressOverlay #overlay-close {
-        margin-top: 1;
-        width: 20;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="overlay-box"):
-            yield Static("Scan in progress — Esc to hide (scan keeps running)")
-            yield RichLog(id="scan-log", highlight=True, markup=True)
-            yield Button("Hide overlay", id="overlay-close", variant="default")
-
-    def append_line(self, line: str) -> None:
-        try:
-            self.query_one("#scan-log", RichLog).write(line)
-        except Exception:
-            pass
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss()
-
-
-# ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
 
@@ -391,11 +140,10 @@ class HxxpsinApp(App):
     CSS_PATH = None
 
     BINDINGS = [
-        Binding("ctrl+q", "quit", "Quit"),
-        Binding("?", "step_runner", "Steps"),
-        Binding("ctrl+n", "new_target", "New Target"),
-        Binding("ctrl+p", "show_progress", "Progress"),
-        Binding("ctrl+l", "reload_data", "Reload"),
+        Binding("ctrl+q", "quit",         "Quit"),
+        Binding("escape", "go_back",      "Back", show=False, priority=True),
+        Binding("ctrl+n", "new_session",  "New Session"),
+        Binding("ctrl+l", "reload_data",  "Reload"),
     ]
 
     DEFAULT_CSS = """
@@ -417,7 +165,13 @@ class HxxpsinApp(App):
         super().__init__(**kwargs)
         self._state = AppState()
         self._load_dir = load_dir
-        self._scan_overlay: ScanProgressOverlay | None = None
+        self._stop_requested = False
+        self._scan_loop: asyncio.AbstractEventLoop | None = None
+
+        # Tab navigation history — enables ESC to go back
+        self._tab_history: list[str] = []
+        self._current_main_tab: str = "tab-dashboard"
+        self._nav_back_in_flight: bool = False
 
         # Wire pipeline callback into main.py
         try:
@@ -429,15 +183,17 @@ class HxxpsinApp(App):
         except Exception:
             pass
 
+        # Register as a state listener so "loaded" / "requests_updated" events
+        # automatically refresh all screens on the main thread.
+        self._state.add_listener(self._on_state_event)
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with TabbedContent(id="main-tabs"):
-            with TabPane("Target", id="tab-target"):
-                yield TargetScreen(self._state, id="screen-target")
-            with TabPane("Requests", id="tab-requests"):
-                yield RequestsScreen(self._state, id="screen-requests")
-            with TabPane("Endpoints", id="tab-endpoints"):
-                yield EndpointsScreen(self._state, id="screen-endpoints")
+            with TabPane("Dashboard", id="tab-dashboard"):
+                yield DashboardScreen(self._state, id="screen-dashboard")
+            with TabPane("Spider", id="tab-spider"):
+                yield SpiderScreen(self._state, id="screen-spider")
             with TabPane("Findings", id="tab-findings"):
                 yield FindingsScreen(self._state, id="screen-findings")
             with TabPane("Enrichment", id="tab-enrichment"):
@@ -461,22 +217,220 @@ class HxxpsinApp(App):
 
     # ── inter-tab message routing ─────────────────────────────────────────
 
+    def on_params_panel_send_to_intruder(self, msg: ParamsPanel.SendToIntruder) -> None:
+        """Wrap all selected param names in §§ and load into Intruder."""
+        self._send_to_intruder_params(msg.req, msg.param_names)
+
     def on_send_to_repeater(self, msg: SendToRepeater) -> None:
         repeater = self.query_one("#screen-repeater", RepeaterScreen)
-        repeater.load_request(msg.req)
-        self.query_one("#main-tabs", TabbedContent).active = "tab-repeater"
+        repeater.load_request(msg.req, source=msg.source)
+        self._switch_tab("tab-repeater")
 
     def on_load_auth_into_repeater(self, msg: LoadAuthIntoRepeater) -> None:
         repeater = self.query_one("#screen-repeater", RepeaterScreen)
         req = {"method": "GET", "url": self._state.target or "/", "headers": msg.headers, "body": ""}
-        repeater.load_request(req, auth_headers=msg.headers)
-        self.query_one("#main-tabs", TabbedContent).active = "tab-repeater"
+        repeater.load_request(req, auth_headers=msg.headers, source="Enrichment")
+        self._switch_tab("tab-repeater")
         self.notify("Auth headers loaded into Repeater")
 
     def _send_to_intruder(self, req: dict) -> None:
         intruder = self.query_one("#screen-intruder", IntruderScreen)
         intruder.load_request(req)
-        self.query_one("#main-tabs", TabbedContent).active = "tab-intruder"
+        self._switch_tab("tab-intruder")
+
+    def _send_to_intruder_params(self, req: dict, param_names: list[str]) -> None:
+        """Wrap every listed param in §§ and send to Intruder."""
+        for name in param_names:
+            self._send_to_intruder_param(req, name)
+            req = dict(req)   # work on updated version for next param
+
+        intruder = self.query_one("#screen-intruder", IntruderScreen)
+        intruder.load_request(req)
+        self._switch_tab("tab-intruder")
+        self.notify(
+            f"Intruder: {len(param_names)} param(s) marked — "
+            f"{', '.join('§'+n+'§' for n in param_names[:4])}"
+        )
+
+    def _send_to_intruder_param(self, req: dict, param_name: str) -> None:
+        """Load request into Intruder with a specific parameter wrapped in §§."""
+        import re as _re
+        from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+        import json as _json
+
+        intruder = self.query_one("#screen-intruder", IntruderScreen)
+
+        # Clone the request and mark the target param with §§
+        req = dict(req)
+        url = req.get("url", "")
+        body = req.get("body") or ""
+        marked = False
+
+        # Try GET query param first
+        p = urlparse(url)
+        if p.query:
+            qs = parse_qs(p.query, keep_blank_values=True)
+            if param_name in qs:
+                qs[param_name] = [f"§{qs[param_name][0]}§"]
+                new_query = urlencode(qs, doseq=True)
+                req["url"] = urlunparse(p._replace(query=new_query))
+                marked = True
+
+        # Try POST JSON body
+        if not marked and body:
+            try:
+                obj = _json.loads(body)
+                if isinstance(obj, dict) and param_name in obj:
+                    obj[param_name] = f"§{obj[param_name]}§"
+                    req["body"] = _json.dumps(obj, ensure_ascii=False)
+                    marked = True
+            except Exception:
+                pass
+
+        # Try form-encoded body
+        if not marked and body:
+            try:
+                from urllib.parse import parse_qs as _pqs, urlencode as _enc
+                fields = _pqs(body, keep_blank_values=True)
+                if param_name in fields:
+                    fields[param_name] = [f"§{fields[param_name][0]}§"]
+                    encoded = _enc(fields, doseq=True)
+                    # urlencode percent-encodes § (U+00A7 → %C2%A7); restore the marker
+                    req["body"] = encoded.replace("%C2%A7", "§")
+                    marked = True
+            except Exception:
+                pass
+
+        intruder.load_request(req)
+        self._switch_tab("tab-intruder")
+        self.notify(f"Intruder: fuzzing §{param_name}§")
+
+    def on_context_panel_action(self, msg: ContextPanel.Action) -> None:
+        tabs = self.query_one("#main-tabs", TabbedContent)
+        req = msg.req
+
+        if msg.kind == "repeater":
+            if req:
+                repeater = self.query_one("#screen-repeater", RepeaterScreen)
+                repeater.load_request(req, source="Context")
+                self._switch_tab("tab-repeater")
+
+        elif msg.kind == "intruder":
+            if req:
+                self._send_to_intruder(req)
+
+        elif msg.kind == "intruder_param":
+            if req:
+                self._send_to_intruder_param(req, msg.probe)  # probe holds param name
+
+        elif msg.kind == "run_probe":
+            if req:
+                self._run_probe_on_request(msg.probe, req)
+
+        elif msg.kind == "probe_tab":
+            self._switch_tab("tab-probes")
+            try:
+                probes_tabs = self.query_one("#screen-probes TabbedContent", TabbedContent)
+                probes_tabs.active = f"probes-{msg.probe}"
+            except NoMatches:
+                pass
+
+        elif msg.kind == "nav_tab":
+            self._switch_tab(msg.tab_id)
+
+        elif msg.kind == "spider":
+            self._switch_tab("tab-spider")
+
+    @work(thread=True)
+    def _run_probe_on_request(self, probe: str, req: dict) -> None:
+        """Execute a single probe on one request dict in a background thread."""
+        try:
+            src_path = str(Path(__file__).resolve().parents[1])
+            if src_path not in sys.path:
+                sys.path.insert(0, src_path)
+
+            from tui.probe_runner import RUNNERS
+            runner = RUNNERS.get(probe)
+            if not runner:
+                self.call_from_thread(
+                    self.notify, f"No runner for '{probe}' — use full scan", severity="warning"
+                )
+                return
+
+            url_short = (req.get("url") or "")[:50]
+
+            def _start() -> None:
+                self._state.probe_status[probe] = "running"
+                try:
+                    self.query_one("#alerts-bar", AlertsBar).update_status(
+                        f"Running {probe.upper()}…  {url_short}"
+                    )
+                    self.query_one("#screen-probes").refresh_data()
+                except NoMatches:
+                    pass
+                self.notify(f"{probe.upper()} started on {url_short}", timeout=3)
+
+            self.call_from_thread(_start)
+
+            loop = asyncio.new_event_loop()
+            try:
+                findings = loop.run_until_complete(runner(req))
+            finally:
+                loop.close()
+
+            def _done(findings=findings) -> None:
+                existing = self._state.probe_results.setdefault(probe, [])
+                seen_urls = {f.get("url", f.get("endpoint", "")) for f in existing}
+                new = [f for f in findings
+                       if f.get("url", f.get("endpoint", "")) not in seen_urls]
+                existing.extend(new)
+                self._state.probe_status[probe] = "done"
+                for f in new:
+                    f.setdefault("_probe", probe)
+                    self._state.findings.append(f)
+                # Notify subscribers (Spider sitemap recolors, Findings tab refreshes)
+                if new:
+                    self._state.emit("findings_updated", probe)
+
+                count = len(findings)
+                label = f"{count} finding(s)" if count else "no findings"
+                severity = "warning" if count else "information"
+                self.notify(
+                    f"{probe.upper()} done: {label}",
+                    severity=severity, timeout=6,
+                )
+                try:
+                    self.query_one("#alerts-bar", AlertsBar).update_status(
+                        f"{probe.upper()} done: {label}"
+                    )
+                    self.query_one("#screen-probes").refresh_data()
+                except NoMatches:
+                    pass
+
+                # Jump to the relevant sub-tab on the Probes screen so the user
+                # actually lands on the results, not on whatever tab was open.
+                if count:
+                    self._switch_tab("tab-probes")
+                    try:
+                        probes_tabs = self.query_one(
+                            "#screen-probes TabbedContent", TabbedContent,
+                        )
+                        probes_tabs.active = f"probes-{probe}"
+                    except NoMatches:
+                        pass
+
+            self.call_from_thread(_done)
+
+        except Exception as exc:
+            def _err(exc=exc) -> None:
+                self._state.probe_status[probe] = "failed"
+                self.notify(f"{probe} error: {exc}", severity="error", timeout=10)
+                try:
+                    self.query_one("#alerts-bar", AlertsBar).update_status(f"{probe} failed")
+                    self.query_one("#screen-probes").refresh_data()
+                except NoMatches:
+                    pass
+            self.call_from_thread(_err)
 
     # ── pipeline event handler (called from background thread) ───────────
 
@@ -485,8 +439,7 @@ class HxxpsinApp(App):
 
         if event == "step":
             n, total, label = args
-            line = f"[{n}/{total}] {label}"
-            def _upd(n=n, total=total, label=label, line=line) -> None:
+            def _upd(n=n, total=total, label=label) -> None:
                 try:
                     bar = self.query_one("#alerts-bar", AlertsBar)
                     if n == 1:
@@ -494,38 +447,7 @@ class HxxpsinApp(App):
                     bar.advance_step(n, total, label)
                 except NoMatches:
                     pass
-                if self._scan_overlay:
-                    self._scan_overlay.append_line(f"[bold]{line}[/bold]")
             self.call_from_thread(_upd)
-
-        elif event == "err":
-            msg = args[0]
-            def _upd_err(msg=msg) -> None:
-                if self._scan_overlay:
-                    self._scan_overlay.append_line(f"  {msg}")
-            self.call_from_thread(_upd_err)
-
-        elif event == "collector":
-            out_path, req_count = args
-            def _upd_collector(p=out_path, n=req_count) -> None:
-                try:
-                    import json
-                    from pathlib import Path as _Path
-                    data = json.loads((_Path(p) / "collector.json").read_text())
-                    self._state.requests = data.get("requests", [])
-                    self._state.out_dir = p
-                    self.query_one("#alerts-bar", AlertsBar).update_status(
-                        f"Crawl done: {n} requests"
-                    )
-                    try:
-                        self.query_one("#screen-target", TargetScreen).refresh_data()
-                        self.query_one("#screen-requests", RequestsScreen).refresh_data()
-                        self.query_one("#screen-endpoints", EndpointsScreen).refresh_data()
-                    except NoMatches:
-                        pass
-                except Exception:
-                    pass
-            self.call_from_thread(_upd_collector)
 
         elif event == "canary":
             hit = args[0]
@@ -574,6 +496,7 @@ class HxxpsinApp(App):
                 active_scan=config.get("active_scan", False),
                 auto_fuzz=config.get("auto_fuzz", False),
                 allow_writes=config.get("allow_writes", False),
+                passive=config.get("passive", False),
                 no_auto_auth=False,
                 auto_auth=False,
                 no_param_mine=False,
@@ -620,11 +543,20 @@ class HxxpsinApp(App):
             _main_mod.set_progress_cb(self._on_pipeline_event)
 
             loop = asyncio.new_event_loop()
-            if config.get("quick"):
-                loop.run_until_complete(_main_mod.cmd_quick(args))
-            else:
-                loop.run_until_complete(_main_mod.cmd_scan(args))
-            loop.close()
+            self._scan_loop = loop
+            try:
+                if config.get("quick"):
+                    loop.run_until_complete(_main_mod.cmd_quick(args))
+                else:
+                    loop.run_until_complete(_main_mod.cmd_scan(args))
+            finally:
+                self._scan_loop = None
+                pending = asyncio.all_tasks(loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
 
             # Restore original CrawlConfig
             try:
@@ -641,68 +573,122 @@ class HxxpsinApp(App):
                 except NoMatches:
                     pass
                 self.notify(f"Scan complete → {config['out']}", timeout=8)
-                self._scan_overlay = None
 
             self.call_from_thread(_done)
 
         except Exception as exc:
-            def _err(exc=exc) -> None:
-                self.notify(f"Scan error: {exc}", severity="error", timeout=10)
+            import traceback
+            tb = traceback.format_exc()
+            # Persist the full traceback so the user can debug — a notify toast
+            # is too short to show a stack trace.
+            try:
+                err_file = Path(config["out"]) / "scan_error.log"
+                err_file.parent.mkdir(parents=True, exist_ok=True)
+                err_file.write_text(f"{exc}\n\n{tb}")
+            except Exception:
+                pass
+
+            def _err(exc=exc, out=config.get("out", "?")) -> None:
+                self.notify(
+                    f"Scan error: {exc}  →  see {out}/scan_error.log",
+                    severity="error", timeout=15,
+                )
+                self._state.step_log.append(f"[scan error] {exc}")
                 try:
                     self.query_one("#alerts-bar", AlertsBar).finish_scan("Scan failed")
                 except NoMatches:
                     pass
-                self._scan_overlay = None
+                self._state.scan_status = "done"
+                self._state.emit("err", str(exc))
             self.call_from_thread(_err)
+
+    def _on_state_event(self, event: str, data: Any) -> None:
+        """Called by AppState.emit() — may be from any thread."""
+        if event in ("loaded", "requests_updated"):
+            self.call_from_thread(self._refresh_all)
+        elif event == "crawl_starting":
+            self.call_from_thread(self._on_crawl_starting)
+        elif event == "request_added":
+            req = data
+            self.call_from_thread(self._add_request_to_tree, req)
+
+    def _on_crawl_starting(self) -> None:
+        pass  # Dashboard shows progress; Spider rebuilds live
+
+    def _add_request_to_tree(self, req: dict) -> None:
+        pass  # Spider handles request_added events via its own state listener
+
+    # ── tab history ───────────────────────────────────────────────────────
+
+    def _switch_tab(self, tab_id: str) -> None:
+        """Switch main tab and record history synchronously at the call site."""
+        if not tab_id:
+            return
+        if tab_id != self._current_main_tab:
+            self._tab_history.append(self._current_main_tab)
+            if len(self._tab_history) > 20:
+                self._tab_history.pop(0)
+            self._current_main_tab = tab_id
+        self._nav_back_in_flight = True   # suppress event handler from double-pushing
+        self.query_one("#main-tabs", TabbedContent).active = tab_id
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Track USER-INITIATED tab switches (clicking the tab bar)."""
+        if event.control.id != "main-tabs":
+            return
+        if self._nav_back_in_flight:
+            self._nav_back_in_flight = False
+            return
+        new_tab = event.pane.id or ""
+        if not new_tab or new_tab == self._current_main_tab:
+            return
+        # User clicked the tab bar — push to history
+        self._tab_history.append(self._current_main_tab)
+        if len(self._tab_history) > 20:
+            self._tab_history.pop(0)
+        self._current_main_tab = new_tab
+
+    def action_go_back(self) -> None:
+        """ESC: return to the previously active main tab."""
+        if not self._tab_history:
+            return
+        prev = self._tab_history.pop()
+        self._current_main_tab = prev
+        self._nav_back_in_flight = True
+        self.query_one("#main-tabs", TabbedContent).active = prev
 
     # ── actions ───────────────────────────────────────────────────────────
 
-    def action_new_target(self) -> None:
-        def _on_dismiss(config: dict | None) -> None:
-            if not config:
-                return
+    def action_quit(self) -> None:
+        import os
+        self._stop_requested = True
 
-            # Add to target list (dedup by URL)
-            existing_urls = {t["target"] for t in self._state.targets}
-            if config["target"] not in existing_urls:
-                self._state.targets.append(config)
+        # Cancel tasks in any background event loops (scan, spider)
+        for loop in [self._scan_loop]:
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(
+                    lambda l=loop: [t.cancel() for t in asyncio.all_tasks(l)]
+                )
+        pass  # Spider manages its own lifecycle
 
-            # Update active scope to match this target
-            self._state.target = config["target"]
-            self._state.allowed_hosts = config.get("allowed_hosts", [])
-            self._state.excluded_patterns = config.get("excluded_patterns", [])
+        self.workers.cancel_all()
+        self.exit()
+        # Force-exit after 2 s if threads are still alive
+        import threading
+        def _force() -> None:
+            import time
+            time.sleep(2)
+            os._exit(0)
+        t = threading.Thread(target=_force, daemon=True)
+        t.start()
 
-            # Refresh the Target tab's target list
-            try:
-                self.query_one("#screen-target", TargetScreen).refresh_data()
-            except NoMatches:
-                pass
-
-            if not config.get("launch"):
-                self.notify(f"Added: {config['target']}", timeout=4)
-                return
-
-            # Launch scan
-            overlay = ScanProgressOverlay()
-            self._scan_overlay = overlay
-            self.push_screen(overlay)
-            self.notify(f"Scan started → {config['target']}", timeout=5)
-            try:
-                self.query_one("#alerts-bar", AlertsBar).start_scan()
-            except NoMatches:
-                pass
-            self._run_scan(config)
-
-        self.push_screen(NewTargetModal(self._state), _on_dismiss)
-
-    def action_show_progress(self) -> None:
-        if self._scan_overlay is not None:
-            self.push_screen(self._scan_overlay)
-        else:
-            self.notify("No scan in progress", severity="information")
-
-    def action_step_runner(self) -> None:
-        self.push_screen(StepRunnerModal(self._state))
+    def action_new_session(self) -> None:
+        """Ctrl+N: open the New Session wizard from anywhere."""
+        self._switch_tab("tab-dashboard")
+        try:
+            self.query_one("#screen-dashboard", DashboardScreen).action_new_session()
+        except NoMatches:
+            pass
 
     def action_reload_data(self) -> None:
         if self._state.out_dir:
@@ -714,7 +700,7 @@ class HxxpsinApp(App):
 
     def _refresh_all(self) -> None:
         for screen_id in [
-            "screen-target", "screen-requests", "screen-endpoints",
+            "screen-dashboard", "screen-spider",
             "screen-findings", "screen-enrichment", "screen-probes", "screen-report",
         ]:
             try:
