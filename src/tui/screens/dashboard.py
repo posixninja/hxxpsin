@@ -15,6 +15,7 @@ from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.widgets import Button, Input, Label, ProgressBar, Static, Tree
 
 from ..state import AppState
+from ..widgets.chat_panel import ChatPanel
 from .spider import (
     _build_severity_index,
     _build_site_map,
@@ -56,7 +57,12 @@ class DashboardScreen(Vertical):
         margin-left: 1;
     }
     DashboardScreen #panels {
+        height: 2fr;
+    }
+    DashboardScreen #dash-chat {
         height: 1fr;
+        min-height: 12;
+        margin-top: 1;
     }
     DashboardScreen #sitemap-panel {
         width: 75%;
@@ -124,6 +130,16 @@ class DashboardScreen(Vertical):
         self._current_req: dict | None = None
         self._state.add_listener(self._on_state_event)
 
+    def _chat_controller(self):
+        """Lazily attach a ChatController to the app so it survives panel
+        rebuilds and one MCP subprocess is shared across the session."""
+        from ..mcp_chat.controller import ChatController
+        ctrl = getattr(self.app, "_chat_controller_instance", None)
+        if ctrl is None:
+            ctrl = ChatController(state=self._state)
+            setattr(self.app, "_chat_controller_instance", ctrl)
+        return ctrl
+
     def compose(self) -> ComposeResult:
         # Session import bar
         with Horizontal(id="session-bar"):
@@ -159,6 +175,11 @@ class DashboardScreen(Vertical):
                     yield Static("Log", classes="panel-header", markup=False)
                     with ScrollableContainer():
                         yield Static("", id="log-text")
+
+        # Full-width chat row below the sitemap/side-panel — gets its own
+        # share of the dashboard height so it doesn't compete with the
+        # Status / Alerts / Log blocks for vertical space.
+        yield ChatPanel(self._chat_controller(), id="dash-chat")
 
     def on_mount(self) -> None:
         self.query_one("#status-bar").display = False

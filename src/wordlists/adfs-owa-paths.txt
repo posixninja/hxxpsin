@@ -1,0 +1,68 @@
+# AD-fronted web surface paths — used by ad_probe to enumerate
+# Microsoft-stack endpoints that commonly require Windows auth.
+# One path per line; #-prefixed lines and blanks are ignored.
+# Service classification is done by ad_probe based on the path prefix.
+
+# ADFS — Active Directory Federation Services (SSO / SAML / WS-Trust)
+/adfs/ls/
+/adfs/ls/?wa=wsignin1.0
+/adfs/services/trust/mex
+/adfs/services/trust/2005/usernamemixed
+/adfs/services/trust/13/windowstransport
+
+# Exchange — OWA + EWS + ActiveSync + Autodiscover
+/owa/
+/owa/auth/logon.aspx
+/EWS/Exchange.asmx
+/EWS/Services.wsdl
+/ews/
+/Autodiscover/Autodiscover.xml
+/autodiscover/autodiscover.xml
+/Microsoft-Server-ActiveSync
+/Microsoft-Server-ActiveSync/default.eas
+/mapi/
+/OAB/
+/ecp/
+/PowerShell/
+
+# SharePoint
+/_layouts/15/Authenticate.aspx
+/_layouts/15/start.aspx
+/_vti_bin/
+/_layouts/
+
+# IIS classic + management surfaces
+/iisstart.htm
+/aspnet_client/
+/IISADMPWD/
+/IISWMSVC/
+/iisadmin/
+
+# Certificate services (AD CS)
+/CertSrv/
+/CertEnroll/
+/CertSrv/Default.asp
+
+# Citrix Receiver / StoreFront / NetScaler
+/Citrix/
+/Citrix/StoreWeb/
+/Citrix/Store/
+/vpn/index.html
+/logon/LogonPoint/tmindex.html
+
+# RDS / Remote Desktop Web Access
+/RDWeb/
+/RDWeb/Pages/
+/Rpc/
+
+# WinRM / WS-Management
+/wsman/
+/wsman
+
+# WSUS
+/SimpleAuthWebService/SimpleAuth.asmx
+/ClientWebService/Client.asmx
+/SelfUpdate/
+
+# WebDAV (often NTLM-protected on IIS)
+/_webdav/

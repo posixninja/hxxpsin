@@ -7,10 +7,11 @@ Machine-readable specs live in `vm/expected/*.json`.
 
 ## How to use this
 
-1. Run a scan: `python3 src/main.py scan http://localhost:<port> --out ./output`
-2. Read `output/report.md`
+1. Run a scan: `python3 hxxpsin.py scan http://localhost:<port> --out ./output`
+2. Read `output/report.md` (or `output/briefing.md` for the plain-English version)
 3. Compare found categories against the tables below
-4. Use `vm/compare.py` for automated scoring
+4. Use `vm/compare.py` for ad-hoc scoring, or `vm/testsuite.py` for the full
+   cross-app detection-rate report
 
 ---
 
@@ -55,9 +56,13 @@ Angular SPA + Node.js REST + GraphQL. Challenge system tracks progress.
 | coupon-race | Race Condition | `POST /api/Orders` coupon field | Yes | Race Condition |
 | user-list | Info Disclosure | `GET /api/Users` | Yes (no admin check) | IDOR/BOLA |
 
-**Notes:** Most high-value bugs need auth. Run the scan with `--auth auth.json` after:
+**Notes:** Most high-value bugs need auth. Easiest path:
+
 ```bash
-# Save login session
+# Let AutoAuth provision a Juice Shop account (registration is open)
+python3 hxxpsin.py scan http://localhost:3000 --out ./juice-output
+
+# Or save a Playwright storage_state manually
 python3 -c "
 import asyncio
 from playwright.async_api import async_playwright
@@ -74,12 +79,14 @@ async def save():
 
 asyncio.run(save())
 "
-python3 src/main.py scan http://localhost:3000 --auth juice-auth.json --out ./juice-output
+python3 hxxpsin.py scan http://localhost:3000 --auth juice-auth.json --out ./juice-output
 ```
 
 ---
 
-## VAmPI — `http://localhost:5000`
+## VAmPI — `http://localhost:5050`
+
+> Port 5050 because :5000 clashes with macOS AirPlay Receiver.
 
 Flask REST API. Covers OWASP API Security Top 10 (2019).
 
@@ -94,7 +101,7 @@ Flask REST API. Covers OWASP API Security Top 10 (2019).
 | sqli | API8 | Injection | `POST /users/v1/login` username field | No |
 | swagger-exposed | API9 | Info Disclosure | `GET /openapi3` | No |
 
-**Quick test:** `python3 src/main.py scan http://localhost:5000 --out ./vampi-output`
+**Quick test:** `python3 hxxpsin.py scan http://localhost:5050 --out ./vampi-output`
 VAmPI has an OpenAPI spec at `/openapi3` — hxxpsin will seed from it automatically.
 
 ---
@@ -115,7 +122,7 @@ Dedicated GraphQL attack surface. Good for practicing the full GraphQL kill chai
 
 **hxxpsin quick test:**
 ```bash
-python3 src/main.py scan http://localhost:5013 --out ./dvga-output
+python3 hxxpsin.py scan http://localhost:5013 --out ./dvga-output
 ```
 GraphQL introspection template will be auto-generated.
 
@@ -160,6 +167,54 @@ Java, guided exploitation lessons. Register at `/WebGoat/registration`.
 
 ---
 
+## DVNA — `http://localhost:9191`
+
+OWASP Node.js Vulnerable App. Covers the Node.js-specific OWASP Top 10.
+Common bugs: prototype pollution, NoSQL injection, command injection, SSRF,
+SSJS, weak crypto, hardcoded secrets, RegExDoS.
+
+```bash
+python3 hxxpsin.py scan http://localhost:9191 --out ./dvna-output
+```
+
+---
+
+## WrongSecrets — `http://localhost:7080`
+
+65 secrets-exposure challenges covering hardcoded creds, env vars, Docker
+layers, source-map exposure, and base64-encoded "secrets" in JS bundles.
+
+```bash
+python3 hxxpsin.py scan http://localhost:7080 --out ./wrongsecrets-output
+```
+
+`js_deep_analyzer` + `secrets` + `file_grabber` carry most of the load here.
+
+---
+
+## vAPI — `http://localhost:8000`
+
+OWASP API Top 10 in PHP/Laravel. BOLA, mass assignment, lack of resources &
+rate limiting, broken authentication, injection.
+
+```bash
+python3 hxxpsin.py scan http://localhost:8000 --out ./vapi-output
+```
+
+---
+
+## Mutillidae — `http://localhost:8180`
+
+NOWASP/Mutillidae II. Classic broad coverage: SQLi, XSS, CSRF, LFI, LDAP
+injection, XPATH, command injection, click-jacking, HTML5 storage abuse.
+Login: `admin` / `adminpass`.
+
+```bash
+python3 hxxpsin.py scan http://localhost:8180 --out ./mutillidae-output
+```
+
+---
+
 ## crAPI — `http://localhost:8888`
 
 Separate setup: `bash vm/crapi/setup.sh`
@@ -179,7 +234,21 @@ Separate setup: `bash vm/crapi/setup.sh`
 
 ## Detection rate tracking
 
-Run after each tool update to measure regression/improvement:
+Run after each tool update to measure regression/improvement.
+
+Ground-truth specs currently live in `vm/expected/`:
+
+| File | App |
+|---|---|
+| `hxxpsin-target.json` | Purpose-built target |
+| `juice-shop.json` | OWASP Juice Shop |
+| `vampi.json` | VAmPI |
+| `dvga.json` | DVGA |
+| `dvwa.json` | DVWA |
+| `webgoat.json` | WebGoat |
+| `crapi.json` | crAPI |
+
+### Single app
 
 ```bash
 # Score hxxpsin-target (should be near 100%)
@@ -188,6 +257,19 @@ python3 vm/compare.py http://localhost:8080 vm/expected/hxxpsin-target.json
 # Score Juice Shop (unauthenticated — expect ~30%, needs auth for full coverage)
 python3 vm/compare.py http://localhost:3000 vm/expected/juice-shop.json
 
-# Score VAmPI
-python3 vm/compare.py http://localhost:5000 vm/expected/vampi.json
+# Score VAmPI (port 5050, not 5000, on macOS)
+python3 vm/compare.py http://localhost:5050 vm/expected/vampi.json
 ```
+
+### Cross-app suite
+
+```bash
+# Run the full pipeline against every registered app, capture auth, score
+python3 vm/testsuite.py --save-auth vm/auth.json --out vm/results.json
+
+# Single app, prior session
+python3 vm/testsuite.py --app juice-shop --auth vm/sessions/juice-shop.json
+```
+
+The suite emits a per-category detection-rate table across all apps that
+have an `expected/<app>.json` spec.

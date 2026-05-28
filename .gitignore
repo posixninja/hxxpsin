@@ -4,8 +4,14 @@ external
 .venv
 auth.json
 session.json
-.claude 
+hxxpsin.toml
+*.auth.toml
+manual-auth.json
+.claude
 __pycache__
 *.pyc
 *.pyo
 *.pyd
+.env
+.env.local
+*.key

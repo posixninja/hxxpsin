@@ -15,6 +15,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from collector import Collector, CapturedRequest, CapturedWebSocket, CapturedCookie
+import codec
 
 # ---------------------------------------------------------------------------
 # Bug categories (used as tags on findings)
@@ -38,6 +39,8 @@ class Cat:
     REDIRECT    = "Open Redirect"
     NOSQL       = "NoSQL Injection"
     PROTO_POLL  = "Prototype Pollution"
+    WINDOWS_AUTH = "Windows Auth (NTLM/Kerberos)"
+    SECRETS     = "Exposed Secrets"
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +71,36 @@ class Finding:
             "evidence": self.evidence,
             "body": self.body,
         }
+
+    def to_full_dict(self) -> dict:
+        """Lossless serialization — includes request headers and the captured
+        response. Used to persist ``classify.json`` so downstream tooling
+        (TUI replay, on-demand single-finding solver runs via the A2A
+        ``confirm_finding`` skill) can reconstruct a faithful ``Finding``
+        instance. ``to_dict()`` stays small for ``report.json``."""
+        return {
+            **self.to_dict(),
+            "headers": self.headers,
+            "response_status": self.response_status,
+            "response_headers": self.response_headers,
+            "response_body": self.response_body,
+        }
+
+    @classmethod
+    def from_full_dict(cls, data: dict) -> "Finding":
+        """Inverse of ``to_full_dict``. Tolerant of missing optional fields."""
+        return cls(
+            method=str(data.get("method") or "GET"),
+            url=str(data.get("url") or ""),
+            score=int(data.get("score") or 0),
+            categories=list(data.get("categories") or []),
+            evidence=list(data.get("evidence") or []),
+            body=data.get("body"),
+            headers=data.get("headers"),
+            response_status=data.get("response_status"),
+            response_headers=data.get("response_headers"),
+            response_body=data.get("response_body"),
+        )
 
 
 @dataclass
@@ -327,6 +360,59 @@ def _check_idor_fields(req: CapturedRequest, path: str, params: dict):
         return 4, Cat.IDOR, f"ownership field in request: {m.group(0)}"
 
 
+def _check_encoded_id(req: CapturedRequest, path: str, params: dict):
+    """Flag a request as an IDOR candidate when a URL path segment or query
+    param value decodes via codec.detect() to something that looks like an
+    identifier. Catches the common "we base64'd the ID so it's safe" pattern
+    that _check_idor_path misses because the segment isn't plainly numeric
+    or a UUID."""
+    # Skip if the existing plain-ID path check already matched — no need to
+    # double-score the same finding.
+    if _PATH_ID_RE.search(path):
+        return None
+
+    candidates: list[tuple[str, str]] = []  # (location, value)
+    for seg in path.strip("/").split("/"):
+        if len(seg) >= 8 and not seg.isdigit() and "@" not in seg:
+            candidates.append(("path", seg))
+    for k, vlist in params.items():
+        for v in vlist:
+            if len(v) >= 8 and not v.isdigit():
+                candidates.append((f"query[{k}]", v))
+
+    # Only schemes that suggest a value was *deliberately* obfuscated count
+    # as IDOR hints. URL-encoded emoji / multi-byte UTF-8 / HTML entities are
+    # routine web behavior and produce false positives like the crAPI 🤖
+    # placeholder. base64 / hex / utf7 / jwt are the ones an API author
+    # reaches for when they want to hide an internal ID.
+    _OBFUSCATING_SCHEMES = {"base64", "base64url", "hex_backslash", "hex_0x", "utf7", "jwt"}
+
+    for location, val in candidates[:8]:  # cap to keep classify() cheap
+        ranked = codec.detect(val)
+        if not ranked or ranked[0][1] < 0.75:
+            continue
+        scheme, conf = ranked[0]
+        if scheme not in _OBFUSCATING_SCHEMES:
+            continue
+        if scheme == "jwt":
+            return 4, Cat.AUTH, f"JWT in {location}: {val[:24]}…"
+        try:
+            decoded = codec.decode(val, scheme)
+        except Exception:
+            continue
+        text = decoded.decode("utf-8", "replace") if isinstance(decoded, bytes) else decoded
+        if not text or text == val or len(text) > 200 or not text.isprintable():
+            continue
+        # Reject "decoded to a single grapheme" — emoji and other 1-char
+        # results aren't identifiers. Real encoded IDs decode to ≥3 chars.
+        if len(text) < 3:
+            continue
+        return 3, Cat.IDOR, (
+            f"encoded ID in {location} ({scheme}, conf={conf:.2f}): "
+            f"{val[:24]}… → {text[:48]}"
+        )
+
+
 def _check_priv_fields(req: CapturedRequest, path: str, params: dict):
     haystack = _body_and_params(req.body, params)
     m = _PRIV_FIELD_RE.search(haystack)
@@ -426,6 +512,28 @@ def _check_auth_headers(req: CapturedRequest, path: str, params: dict):
         return 2, Cat.AUTH, "X-API-Key header present"
 
 
+def _check_windows_auth(req: CapturedRequest, path: str, params: dict):
+    if not req.response_headers:
+        return None
+    auth = ""
+    for k, v in req.response_headers.items():
+        if k.lower() == "www-authenticate":
+            auth = v
+            break
+    if not auth:
+        return None
+    al = auth.lower()
+    if "negotiate" in al:
+        return 4, Cat.WINDOWS_AUTH, ("WWW-Authenticate: Negotiate — Kerberos/NTLM via SPNEGO; "
+                                     "decode Type-2 challenge for domain/SPN, test for relay")
+    if "ntlm" in al:
+        return 4, Cat.WINDOWS_AUTH, ("WWW-Authenticate: NTLM — raw NTLM; "
+                                     "test for relay, null-session, and weak credentials")
+    if "kerberos" in al:
+        return 4, Cat.WINDOWS_AUTH, "WWW-Authenticate: Kerberos — test SPN coverage and pre-auth"
+    return None
+
+
 def _check_csrf_surface(req: CapturedRequest, path: str, params: dict):
     # Only flag traditional form submissions — REST/JSON APIs are CSRF-safe via SameSite + CORS.
     if req.method not in ("POST", "PUT", "PATCH", "DELETE"):
@@ -484,6 +592,31 @@ def _check_cors(req: CapturedRequest, path: str, params: dict):
         return 2, Cat.CORS, "API endpoint — probe CORS origin policy"
 
 
+def _check_response_secrets(req: CapturedRequest, path: str, params: dict):
+    """Scan the response body for credential-shaped strings via the unified
+    [[secrets]] catalog. Each non-public_by_design hit boosts score by the
+    pattern confidence (rounded) and tags Cat.SECRETS so the operator sees
+    the leak prominently."""
+    body = getattr(req, "response_body", None)
+    if not body:
+        return None
+    import secrets as _secrets
+    matches = _secrets.scan(body, min_confidence=0.75)
+    # public_by_design (stripe_test, google_maps frontend keys, etc.) get
+    # surfaced informationally but not scored — they're meant to be exposed.
+    actionable = [m for m in matches if not m.public_by_design]
+    if not actionable:
+        return None
+    # Tally up to 3 most-confident kinds; clamp score so a single noisy
+    # response can't dominate the report.
+    kinds = sorted({m.kind for m in actionable})[:3]
+    delta = min(6, len(actionable) + 2)
+    return delta, Cat.SECRETS, (
+        f"response body contains {len(actionable)} secret-shaped "
+        f"string(s): {', '.join(kinds)}"
+    )
+
+
 def _check_open_redirect(req: CapturedRequest, path: str, params: dict):
     for param in params:
         if _REDIRECT_PARAM_RE.match(param):
@@ -534,6 +667,7 @@ _REQUEST_CHECKS = [
     _check_state_changing,
     _check_idor_path,
     _check_idor_fields,
+    _check_encoded_id,
     _check_priv_fields,
     _check_mass_assign_endpoint,
     _check_ssrf_fields,
@@ -542,6 +676,7 @@ _REQUEST_CHECKS = [
     _check_race,
     _check_injection_params,
     _check_auth_headers,
+    _check_windows_auth,
     _check_csrf_surface,
     _check_csrf_xhr,
     _check_auth_bypass_path,
@@ -550,6 +685,7 @@ _REQUEST_CHECKS = [
     _check_open_redirect,
     _check_nosql,
     _check_proto_pollution,
+    _check_response_secrets,
 ]
 
 

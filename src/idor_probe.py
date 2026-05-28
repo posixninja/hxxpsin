@@ -31,6 +31,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+import codec
+
 
 # Path patterns that suggest a per-tenant resource — these are the highest-value
 # IDOR test targets because the URL itself names the resource owner.
@@ -54,6 +56,79 @@ _AUTH_HEADER_NAMES = (
     "authorization", "x-auth-token", "x-access-token", "x-api-token",
     "x-id-token", "x-session-token", "x-jwt", "auth-token",
 )
+
+
+def _encoded_id_segments(url: str) -> list[tuple[str, str, str]]:
+    """Find URL path segments whose contents decode to plausibly-mutatable
+    identifiers (e.g. base64('user42') → 'dXNlcjQy'). Returns a list of
+    (original_segment, scheme, decoded_text) tuples for the encoded-ID swap
+    pass. Skips segments already handled by _NUMERIC_ID_RE / _UUID_RE /
+    _EMAIL_RE."""
+    path = urlparse(url).path
+    out: list[tuple[str, str, str]] = []
+    for seg in path.strip("/").split("/"):
+        if not seg or len(seg) < 8:
+            continue
+        # Already handled by other passes
+        if seg.isdigit():
+            continue
+        if _UUID_RE.search("/" + seg + "/"):
+            continue
+        if "@" in seg:
+            continue
+
+        ranked = codec.detect(seg)
+        if not ranked or ranked[0][1] < 0.75:
+            continue
+        for scheme, _conf in ranked[:2]:
+            if scheme == "jwt":
+                continue  # JWTs in URL paths are rare; not worth the noise
+            try:
+                decoded = codec.decode(seg, scheme)
+            except Exception:
+                continue
+            text = decoded.decode("utf-8", "replace") if isinstance(decoded, bytes) else decoded
+            if not text or text == seg:
+                continue
+            if len(text) > 200 or not text.isprintable():
+                continue
+            out.append((seg, scheme, text))
+            break
+    return out
+
+
+def _mutate_decoded_id(text: str) -> list[str]:
+    """Generate a small set of ID-mutation candidates for `text` decoded
+    from an encoded URL segment. Returns up to 5 distinct candidates."""
+    cands: list[str] = []
+    seen: set[str] = {text}
+    if text.isdigit():
+        n = int(text)
+        # Interleave small deltas with canonical low IDs so the 5-candidate
+        # cap doesn't crowd out the seeded-admin probes.
+        for delta in (1, -1, 10):
+            v = n + delta
+            if v >= 0 and str(v) not in seen:
+                cands.append(str(v))
+                seen.add(str(v))
+        for canon in ("1", "2", "0"):
+            if canon not in seen:
+                cands.append(canon)
+                seen.add(canon)
+    else:
+        # Increment any trailing digits in the decoded text
+        m = re.search(r"(\d+)$", text)
+        if m:
+            mutated = text[:m.start()] + str(int(m.group(1)) + 1)
+            if mutated not in seen:
+                cands.append(mutated)
+                seen.add(mutated)
+        # Substitute the last character — catches lexicographic ID schemes
+        if text:
+            sub = text[:-1] + ("A" if text[-1] != "A" else "B")
+            if sub not in seen:
+                cands.append(sub)
+    return cands[:5]
 
 
 @dataclass
@@ -503,6 +578,44 @@ class IDORProbe:
                         break  # stop at first confirmed/likely id-swap
                 except Exception:
                     continue
+
+        # ── Test 3: encoded ID swap — base64/hex IDs in URL path ─────────
+        # Plain numeric/UUID/email IDs are handled above. If the URL still
+        # has a segment that codec.detect identifies as encoded, decode it,
+        # mutate the decoded form, re-encode, and run the same A-vs-A swap.
+        # Bounded to 2 distinct encoded segments × 3 mutations = 6 extra
+        # requests per endpoint, only when an encoded segment is actually
+        # present.
+        for orig_seg, scheme, decoded_text in _encoded_id_segments(finding.url)[:2]:
+            mutated = False
+            for mutated_decoded in _mutate_decoded_id(decoded_text)[:3]:
+                try:
+                    re_encoded = codec.encode(mutated_decoded, scheme)
+                except Exception:
+                    continue
+                if re_encoded == orig_seg:
+                    continue
+                swapped_url = finding.url.replace(orig_seg, re_encoded, 1)
+                try:
+                    ra_orig = await self._fetch(client, method, finding.url, a, finding.body)
+                    ra_swap = await self._fetch(client, method, swapped_url, a, finding.body)
+                    r_anon = await self._fetch(client, method, swapped_url, anon_acc, finding.body)
+                    f3 = self._compare(method, swapped_url, "encoded_id_swap",
+                                       a, a, ra_orig, ra_swap, r_anon)
+                    if f3:
+                        f3.evidence = (
+                            f"Encoded ID swap ({scheme}): segment "
+                            f"{orig_seg!r} decoded to {decoded_text!r}; "
+                            f"mutated to {mutated_decoded!r}; "
+                            f"re-encoded as {re_encoded!r}. " + f3.evidence
+                        )
+                        out.append(f3)
+                        mutated = True
+                        break
+                except Exception:
+                    continue
+            if mutated:
+                break
 
         return out
 

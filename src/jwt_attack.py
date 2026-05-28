@@ -24,7 +24,9 @@ from typing import Optional
 
 import httpx
 
-from classifier import Cat
+# `from classifier import Cat` is deferred to the call site that needs it
+# (find_jwts_in_findings). Importing it at module level creates a cycle once
+# classifier imports codec, and codec imports jwt_attack for base64url helpers.
 
 # ---------------------------------------------------------------------------
 # Weak secret wordlist (~200 common JWT secrets)
@@ -278,6 +280,7 @@ class JWTAnalyzer:
         Collect JWT tokens from Auth/Session findings and cookie findings,
         then run all attacks.
         """
+        from classifier import Cat  # deferred — see top-of-module note
         result = JWTAttackResult()
         token_endpoint_pairs: list[tuple[str, str, str]] = []  # (token, url, method)
 

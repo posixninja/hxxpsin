@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse, urlencode, parse_qs
 
+import codec
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -152,13 +154,16 @@ class WSProbe:
 
         # Gather frames the crawler passively observed for this URL
         sent_frames: list[dict] = []
+        received_frames: list[dict] = []
         for ws in captured:
             if ws.url == url:
                 sent_frames = ws.messages_sent
+                received_frames = getattr(ws, "messages_received", []) or []
                 break
             # Match Socket.io URLs loosely (sid will differ)
             if is_sio and _is_socketio_url(ws.url) and _sio_base(ws.url) == _sio_base(url):
                 sent_frames = ws.messages_sent
+                received_frames = getattr(ws, "messages_received", []) or []
                 break
 
         tests = [
@@ -172,6 +177,15 @@ class WSProbe:
 
         if sent_frames:
             await self._test_sub_idor(url, sent_frames, result)
+
+        # Passive scan: surface encoded payloads (JWTs, URLs, secret blobs)
+        # hidden inside captured frame bodies. No network traffic; just
+        # decodes what the crawler already captured.
+        if sent_frames or received_frames:
+            encoded_findings = _scan_frames_for_encoded_payloads(
+                url, sent_frames, received_frames,
+            )
+            result.findings.extend(encoded_findings)
 
     # ------------------------------------------------------------------
     # Individual tests
@@ -618,11 +632,174 @@ def _find_subscribe_frame(frames: list[dict]) -> Optional[tuple[str, str, str]]:
 
 
 def _mutate_id(val) -> str:
-    """Increment integer IDs or append '-2' to string IDs."""
+    """Mutate a channel/room ID for the subscribe-IDOR probe.
+
+    Strategy:
+      1. Plain int → +1
+      2. base64/hex/utf7-looking string (codec.detect ≥ 0.75) → decode,
+         mutate the decoded form, re-encode. This catches APIs that obfuscate
+         channel IDs by base64-encoding internal integer keys.
+      3. String ending in "-1" → "-2"
+      4. Fallback → append "-2"
+    """
+    # 1. Plain integer
     try:
         return str(int(val) + 1)
     except (TypeError, ValueError):
-        s = str(val)
-        if s.endswith("-1"):
-            return s[:-2] + "-2"
-        return s + "-2"
+        pass
+
+    s = str(val)
+
+    # 2. Encoded ID — only when codec confidently identifies an obfuscating
+    # scheme (base64/hex/utf7). url/html/unicode are routine encodings and
+    # don't indicate the ID was *deliberately* hidden. 4-char minimum lets
+    # us catch short base64-encoded integers like "MTAw" (base64 of "100"),
+    # which are common as WS channel IDs.
+    if len(s) >= 4:
+        ranked = codec.detect(s)
+        if ranked and ranked[0][1] >= 0.75:
+            scheme = ranked[0][0]
+            if scheme in ("base64", "base64url", "hex_backslash", "hex_0x", "utf7"):
+                try:
+                    decoded = codec.decode(s, scheme)
+                    decoded_text = (
+                        decoded.decode("utf-8", "replace")
+                        if isinstance(decoded, bytes) else decoded
+                    )
+                    if decoded_text and decoded_text.isprintable():
+                        # Recurse — apply the same mutation logic to the
+                        # decoded form, then re-encode
+                        mutated_decoded = _mutate_id(decoded_text)
+                        if mutated_decoded != decoded_text:
+                            return codec.encode(mutated_decoded, scheme)
+                except Exception:
+                    pass
+
+    # 3 / 4. String fallbacks
+    if s.endswith("-1"):
+        return s[:-2] + "-2"
+    return s + "-2"
+
+
+# ---------------------------------------------------------------------------
+# Passive scan: surface encoded payloads inside captured WS frames
+# ---------------------------------------------------------------------------
+
+def _scan_frames_for_encoded_payloads(url: str,
+                                       sent_frames: list,
+                                       received_frames: list) -> list[dict]:
+    """Walk captured WS frame bodies through codec.try_decode_all and emit
+    a finding dict for any frame that hides a URL, JWT, or
+    secret-keyword-bearing payload behind base64/jwt/hex.
+
+    Sent frames are higher-signal (what the client *encoded* before sending)
+    so we prefix the evidence with direction. Returns a list of findings to
+    merge into WSProbeResult.findings."""
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()  # (direction, scheme, decoded_prefix)
+
+    for direction, frames in (("sent", sent_frames), ("received", received_frames)):
+        for frame in frames or []:
+            raw = _frame_raw(frame)
+            if not raw or len(raw) < 16:
+                continue
+            # If the frame itself is JSON, also scan each string-typed
+            # value individually — encoded blobs are often nested
+            payloads = [raw]
+            try:
+                obj = json.loads(raw)
+                payloads.extend(_collect_string_values(obj))
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            for candidate in payloads[:24]:  # cap per frame
+                if not isinstance(candidate, str) or len(candidate) < 16:
+                    continue
+                ranked = codec.detect(candidate)
+                if not ranked or ranked[0][1] < 0.75:
+                    continue
+                top_scheme = ranked[0][0]
+                if top_scheme not in ("base64", "base64url", "hex_backslash",
+                                       "hex_0x", "jwt"):
+                    continue
+
+                layers = codec.try_decode_all(candidate, max_depth=2)
+                for scheme, decoded in layers:
+                    if not _is_interesting(decoded):
+                        continue
+                    key = (direction, scheme, decoded[:40])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    hint = _classify_payload(decoded)
+                    out.append({
+                        "category": "websocket_encoded_payload",
+                        "severity": hint["severity"],
+                        "url": url,
+                        "evidence": (
+                            f"{direction} frame contains {scheme}-encoded "
+                            f"{hint['label']}: {candidate[:32]}… → {decoded[:80]}"
+                        ),
+                        "impact": (
+                            "Encoded WS payloads often carry session tokens, "
+                            "internal URLs, or structured data the operator "
+                            "should treat as in-scope for tampering tests."
+                        ),
+                    })
+                    break  # one finding per candidate
+    return out
+
+
+def _frame_raw(frame) -> str:
+    if isinstance(frame, dict):
+        return frame.get("raw") or frame.get("body") or ""
+    return str(frame) if frame is not None else ""
+
+
+def _collect_string_values(obj, depth: int = 0) -> list[str]:
+    """Recursively pull every string value out of a JSON-decoded object.
+    Capped at depth 4 to avoid pathological structures."""
+    if depth > 4:
+        return []
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        out = []
+        for v in obj.values():
+            out.extend(_collect_string_values(v, depth + 1))
+        return out
+    if isinstance(obj, list):
+        out = []
+        for v in obj[:16]:  # cap list iteration
+            out.extend(_collect_string_values(v, depth + 1))
+        return out
+    return []
+
+
+_SECRET_KW_RE = re.compile(
+    r'(secret|password|api[_-]?key|access[_-]?token|bearer|private[_-]?key)',
+    re.IGNORECASE,
+)
+
+
+def _is_interesting(s: str) -> bool:
+    if not s or len(s) < 4:
+        return False
+    printable = sum(1 for c in s if 32 <= ord(c) < 127 or c in "\t\n\r")
+    if printable / len(s) < 0.85:
+        return False
+    return bool(re.search(
+        r'(https?://|^\{|^\[|"alg"|"typ"|"sub"|"iss"|=|/api/|/v\d+/)', s
+    ))
+
+
+def _classify_payload(s: str) -> dict:
+    if _SECRET_KW_RE.search(s):
+        return {"severity": "high", "label": "secret-bearing payload"}
+    if '"alg"' in s or '"typ"' in s:
+        return {"severity": "medium", "label": "JWT header"}
+    if '"sub"' in s or '"iss"' in s or '"exp"' in s:
+        return {"severity": "medium", "label": "JWT claims"}
+    if 'http://' in s or 'https://' in s:
+        return {"severity": "medium", "label": "URL"}
+    return {"severity": "low", "label": "structured value"}

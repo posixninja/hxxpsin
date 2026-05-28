@@ -21,6 +21,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+import codec
+
 try:
     import jsbeautifier as _jsb
     _HAS_BEAUTIFIER = True
@@ -94,19 +96,9 @@ _COGNITO_RE = re.compile(
 )
 _CLERK_RE = re.compile(r'pk_(?:test|live)_[A-Za-z0-9]{20,}')
 
-# Secrets — (pattern, severity, public_by_design)
-_SECRET_PATTERNS: list[tuple] = [
-    ("aws_access_key",  re.compile(r'AKIA[0-9A-Z]{16}'),                    "critical", False),
-    ("github_token",    re.compile(r'ghp_[A-Za-z0-9_]{36,}'),               "critical", False),
-    ("gitlab_token",    re.compile(r'glpat-[A-Za-z0-9\-_]{20}'),            "critical", False),
-    ("stripe_live",     re.compile(r'sk_live_[A-Za-z0-9]{20,}'),            "critical", False),
-    ("private_key",     re.compile(r'-----BEGIN (?:RSA|EC|OPENSSH|PRIVATE) KEY'), "critical", False),
-    ("slack_token",     re.compile(r'xox[baprs]-[A-Za-z0-9\-]{10,}'),      "high",     False),
-    ("sendgrid",        re.compile(r'SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}'), "high", False),
-    ("jwt_secret",      re.compile(r'''(?:secret|signing_key|jwt_secret)\s*[:=]\s*["'`]([A-Za-z0-9+/=_\-]{20,})["'`]''', re.IGNORECASE), "high", False),
-    ("stripe_test",     re.compile(r'sk_test_[A-Za-z0-9]{20,}'),            "low",      True),
-    ("google_maps",     re.compile(r'AIza[0-9A-Za-z\-_]{35}'),              "medium",   True),
-]
+# Secret detection delegates to [[secrets]] — see _extract_secrets() below.
+# The unified catalog has ~27 kinds vs the 10 that used to live here, and
+# is shared with enricher, classifier, codec.annotate, and cloud_probe.
 
 # DOM XSS sinks
 _SINKS = [
@@ -131,6 +123,153 @@ _SOURCES_LIST = [
     ("sessionStorage",    r'sessionStorage\.getItem'),
     ("URLSearchParams",   r'URLSearchParams'),
 ]
+
+# ---------------------------------------------------------------------------
+# DOM clobbering — JS code that reads globals attackers can shadow via HTML
+# ---------------------------------------------------------------------------
+
+# Window builtins we DON'T flag — these aren't realistically clobberable
+# because the browser owns them.
+_WINDOW_BUILTINS: set[str] = {
+    "location", "navigator", "document", "history", "screen", "innerWidth",
+    "innerHeight", "outerWidth", "outerHeight", "scrollX", "scrollY",
+    "pageXOffset", "pageYOffset", "devicePixelRatio", "localStorage",
+    "sessionStorage", "crypto", "fetch", "console", "performance",
+    "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+    "requestAnimationFrame", "cancelAnimationFrame", "addEventListener",
+    "removeEventListener", "postMessage", "open", "close", "alert", "prompt",
+    "confirm", "atob", "btoa", "URL", "URLSearchParams", "Blob", "File",
+    "FileReader", "FormData", "Headers", "Request", "Response", "WebSocket",
+    "Worker", "SharedWorker", "EventSource", "AbortController", "Intl",
+    "JSON", "Math", "Object", "Array", "String", "Number", "Boolean", "Date",
+    "RegExp", "Map", "Set", "WeakMap", "WeakSet", "Promise", "Symbol",
+    "Proxy", "Reflect", "Error", "TypeError", "RangeError", "self", "top",
+    "parent", "frames", "frameElement", "name", "origin", "isSecureContext",
+    "matchMedia", "getComputedStyle", "scrollTo", "scrollBy", "focus", "blur",
+    "trustedTypes", "caches", "indexedDB",
+}
+
+_DOM_API_ALLOWLIST: set[str] = {
+    "getElementById", "getElementsByTagName", "getElementsByClassName",
+    "getElementsByName", "querySelector", "querySelectorAll", "createElement",
+    "createTextNode", "createDocumentFragment", "createElementNS",
+    "createComment", "createEvent", "createRange", "createTreeWalker",
+    "addEventListener", "removeEventListener", "dispatchEvent",
+    "body", "head", "documentElement", "title", "cookie", "domain", "URL",
+    "referrer", "readyState", "location", "forms", "images", "links",
+    "scripts", "styleSheets", "anchors", "embeds", "all", "activeElement",
+    "currentScript", "defaultView", "implementation", "characterSet",
+    "contentType", "compatMode", "doctype", "fullscreenElement", "hidden",
+    "visibilityState", "execCommand", "queryCommandSupported",
+    "queryCommandEnabled", "open", "close", "write", "writeln", "hasFocus",
+    "elementFromPoint", "elementsFromPoint", "getSelection",
+    "evaluate", "importNode", "adoptNode", "fonts",
+}
+
+_DOMC_WINDOW_READ_RE = re.compile(
+    r'\b(?:window|self)\s*(?:\.([A-Za-z_]\w{1,30})|\[\s*["\']([A-Za-z_]\w{1,30})["\']\s*\])'
+)
+
+_DOMC_DOC_NAMED_RE = re.compile(
+    r'\bdocument\s*\.\s*([A-Za-z_]\w{1,30})\b'
+)
+
+# var x = window.x || ...  /  const x = self.x || ...
+_DOMC_FALLBACK_RE = re.compile(
+    r'(?:var|let|const)\s+(\w{2,30})\s*=\s*(?:window|self)\s*\.\s*\1\s*\|\|'
+)
+
+_DOMC_TRUTHY_RE = re.compile(
+    r'if\s*\(\s*(?:window\.)?([A-Za-z_]\w{1,20})\s*\)'
+)
+
+_DOMC_GETBYID_PROP_RE = re.compile(
+    r'document\.getElementById\(\s*["\']([^"\']{1,60})["\']\s*\)\s*\.\s*([A-Za-z_]\w*)'
+)
+
+# Element properties that are legitimate (not signals of clobbering misuse)
+_ELEMENT_PROP_ALLOWLIST: set[str] = {
+    "value", "checked", "innerHTML", "innerText", "textContent", "outerHTML",
+    "className", "classList", "style", "id", "name", "type", "src", "href",
+    "alt", "title", "disabled", "selected", "options", "form", "files",
+    "dataset", "children", "childNodes", "firstChild", "lastChild",
+    "parentNode", "parentElement", "nextSibling", "previousSibling",
+    "appendChild", "removeChild", "replaceChild", "insertBefore",
+    "addEventListener", "removeEventListener", "click", "focus", "blur",
+    "submit", "reset", "select", "scrollIntoView", "getAttribute",
+    "setAttribute", "removeAttribute", "hasAttribute", "remove",
+    "getBoundingClientRect", "offsetWidth", "offsetHeight", "offsetTop",
+    "offsetLeft", "clientWidth", "clientHeight", "scrollTop", "scrollLeft",
+    "tagName", "nodeName", "nodeType", "attributes",
+}
+
+# ---------------------------------------------------------------------------
+# Prototype pollution — sinks that can write to Object.prototype
+# ---------------------------------------------------------------------------
+
+_PROTO_LITERAL_RE = re.compile(
+    r'(?:\[\s*["\']__proto__["\']\s*\]|\.__proto__|\bconstructor\s*\.\s*prototype)'
+)
+
+_PROTO_LODASH_RE = re.compile(
+    r'\b(?:_|lodash)\s*\.\s*(merge|mergeWith|set|setWith|defaultsDeep|assignInWith|update|updateWith)\s*\('
+)
+
+_PROTO_JQ_EXTEND_RE = re.compile(
+    r'(?:jQuery|\$)\s*\.\s*extend\s*\(\s*true\s*,'
+)
+
+_PROTO_OBJECT_ASSIGN_RE = re.compile(
+    r'Object\.assign\s*\(\s*(\{\s*\}|target|[a-z_]\w*)\s*,'
+)
+
+_PROTO_RECURSIVE_MERGE_RE = re.compile(
+    r'for\s*\(\s*(?:var|let|const)?\s*(\w+)\s+(?:in|of)\s+\w+(?:\s*\)|\.keys\(\s*\w+\s*\)\s*\))[^{}]{0,80}\{\s*[^{}]{0,200}\[\s*\1\s*\]\s*='
+)
+
+_PROTO_PATH_SETTER_RE = re.compile(
+    r'\b(?:set|setIn|setPath|deepSet)\s*\(\s*\w+\s*,\s*["\'`][^"\'`]*[\.\[]'
+)
+
+_JSON_PARSE_RE = re.compile(r'JSON\.parse\s*\(')
+_USER_INPUT_HINT_RE = re.compile(
+    r'\b(?:req\.body|request\.body|location\.(?:search|hash)|window\.name|'
+    r'document\.referrer|event\.data|URLSearchParams|userInput|userdata|'
+    r'JSON\.parse)\b',
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Trusted Types — policy presence + sink-without-wrap violations
+# ---------------------------------------------------------------------------
+
+_TT_CREATE_POLICY_RE = re.compile(
+    r'trustedTypes\s*\.\s*createPolicy\s*\(\s*["\'`]([^"\'`]{1,60})["\'`]'
+)
+
+_TT_POLICY_QUERY_RE = re.compile(
+    r'trustedTypes\s*\.\s*(getPolicyNames|defaultPolicy)\b'
+)
+
+_TT_CSP_HINT_RE = re.compile(
+    r'''require-trusted-types-for[\s:'"]*['"]?script['"]?''',
+    re.IGNORECASE,
+)
+
+_TT_WORKER_RE = re.compile(r'new\s+Worker\s*\(\s*([^),]{1,80})')
+_TT_SCRIPT_SRC_RE = re.compile(
+    r'\.\s*src\s*=\s*([A-Za-z_$][\w$.\[\]]{0,60})'
+)
+_TT_REACT_DSI_RE = re.compile(
+    r'dangerouslySetInnerHTML\s*:\s*\{\s*__html\s*:\s*([^,}]{1,80})'
+)
+
+# RHS expressions that indicate the assigned value already went through a
+# sanitizer or TT policy — these suppress the violation.
+_TT_WRAP_RE = re.compile(
+    r'\b(?:trustedHTML|tt[A-Z]\w*|policy\.create|sanitize|DOMPurify\.sanitize|'
+    r'\.createHTML\(|\.createScript\(|\.createScriptURL\()',
+)
 
 
 # ---------------------------------------------------------------------------
@@ -182,10 +321,75 @@ class JSDomXss:
     sink: str
     source_file: str
     priority: str = "medium"
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {"source": self.source, "sink": self.sink,
+                "priority": self.priority, "source_file": self.source_file,
+                "notes": self.notes}
+
+
+@dataclass
+class JSDomClobbering:
+    pattern: str            # window_fallback_init | document_named_element | truthy_check_clobberable | getbyid_prop_chain | window_named_read
+    matched_code: str
+    identifier: Optional[str]
+    source_file: str
+    priority: str = "medium"
+
+    def to_dict(self) -> dict:
+        return {"pattern": self.pattern, "matched_code": self.matched_code[:120],
+                "identifier": self.identifier, "priority": self.priority,
+                "source_file": self.source_file}
+
+
+@dataclass
+class JSPrototypePollution:
+    sink: str               # lodash_merge | jquery_extend_deep | proto_literal | object_assign | recursive_merge | path_setter
+    target: Optional[str]
+    matched_code: str
+    near_user_input: bool
+    severity: str           # high | medium | low
+    source_file: str
+
+    def to_dict(self) -> dict:
+        return {"sink": self.sink, "target": self.target,
+                "matched_code": self.matched_code[:120],
+                "near_user_input": self.near_user_input,
+                "severity": self.severity, "source_file": self.source_file}
+
+
+@dataclass
+class JSTrustedTypesViolation:
+    sink: str
+    has_policy_in_scope: bool
+    matched_code: str
+    priority: str
+    source_file: str
+
+    def to_dict(self) -> dict:
+        return {"sink": self.sink,
+                "has_policy_in_scope": self.has_policy_in_scope,
+                "matched_code": self.matched_code[:120],
                 "priority": self.priority, "source_file": self.source_file}
+
+
+@dataclass
+class JSTrustedTypes:
+    source_file: str
+    has_policy: bool
+    policy_names: list[str]
+    has_default_policy: bool
+    enforces_csp_hint: bool
+    violations: list[JSTrustedTypesViolation] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {"source_file": self.source_file,
+                "has_policy": self.has_policy,
+                "policy_names": self.policy_names,
+                "has_default_policy": self.has_default_policy,
+                "enforces_csp_hint": self.enforces_csp_hint,
+                "violations": [v.to_dict() for v in self.violations]}
 
 
 @dataclass
@@ -235,11 +439,33 @@ class JSConfig:
 
 
 @dataclass
+class JSDecodedSecret:
+    """A literal in the JS bundle that decoded to something meaningful via
+    codec (base64/base64url/hex/JWT). Surfaces secrets the regex-based
+    _extract_secrets misses because they're wrapped in an encoding layer."""
+    original: str            # truncated to 32 chars
+    scheme: str              # detected encoding scheme (base64, jwt, ...)
+    decoded: str             # truncated to 200 chars
+    severity: str            # critical | high | medium | low
+    hint: str                # short label of what the decoded blob looks like
+    source_file: str
+
+    def to_dict(self) -> dict:
+        return {"original": self.original, "scheme": self.scheme,
+                "decoded": self.decoded, "severity": self.severity,
+                "hint": self.hint, "source_file": self.source_file}
+
+
+@dataclass
 class JSAnalysisResult:
     endpoints: list[JSEndpoint] = field(default_factory=list)
     graphql_ops: list[JSGraphQLOp] = field(default_factory=list)
     secrets: list[JSSecret] = field(default_factory=list)
+    decoded_secrets: list[JSDecodedSecret] = field(default_factory=list)
     dom_xss: list[JSDomXss] = field(default_factory=list)
+    dom_clobbering: list[JSDomClobbering] = field(default_factory=list)
+    prototype_pollution: list[JSPrototypePollution] = field(default_factory=list)
+    trusted_types: list[JSTrustedTypes] = field(default_factory=list)
     auth_smells: list[JSAuthSmell] = field(default_factory=list)
     storage_usage: list[JSStorageUsage] = field(default_factory=list)
     source_maps: list[JSSourceMap] = field(default_factory=list)
@@ -255,7 +481,11 @@ class JSAnalysisResult:
             "endpoints": [e.to_dict() for e in self.endpoints],
             "graphql_ops": [g.to_dict() for g in self.graphql_ops],
             "secrets": [s.to_dict() for s in self.secrets],
+            "decoded_secrets": [d.to_dict() for d in self.decoded_secrets],
             "dom_xss": [d.to_dict() for d in self.dom_xss],
+            "dom_clobbering": [c.to_dict() for c in self.dom_clobbering],
+            "prototype_pollution": [p.to_dict() for p in self.prototype_pollution],
+            "trusted_types": [t.to_dict() for t in self.trusted_types],
             "auth_smells": [a.to_dict() for a in self.auth_smells],
             "storage_usage": [s.to_dict() for s in self.storage_usage],
             "source_maps": [s.to_dict() for s in self.source_maps],
@@ -267,12 +497,18 @@ class JSAnalysisResult:
         }
 
     def summary(self) -> str:
+        tt_violations = sum(len(t.violations) for t in self.trusted_types)
+        tt_with_policy = sum(1 for t in self.trusted_types if t.has_policy)
         lines = [
             f"Files analyzed:    {self.files_analyzed}",
             f"Endpoints:         {len(self.endpoints)}",
             f"GraphQL ops:       {len(self.graphql_ops)}",
             f"Secrets:           {len(self.secrets)} ({sum(1 for s in self.secrets if s.severity == 'critical')} critical)",
+            f"Decoded secrets:   {len(self.decoded_secrets)} ({sum(1 for d in self.decoded_secrets if d.severity in ('critical', 'high'))} high+)",
             f"DOM XSS signals:   {len(self.dom_xss)}",
+            f"DOM clobbering:    {len(self.dom_clobbering)}",
+            f"Proto pollution:   {len(self.prototype_pollution)} ({sum(1 for p in self.prototype_pollution if p.severity == 'high')} high)",
+            f"Trusted Types:     {tt_violations} violations across {len(self.trusted_types)} files ({tt_with_policy} with policy)",
             f"Auth smells:       {len(self.auth_smells)}",
             f"Storage usage:     {len(self.storage_usage)}",
             f"Source maps:       {len(self.source_maps)}",
@@ -285,6 +521,11 @@ class JSAnalysisResult:
             for s in self.secrets:
                 flag = " (PUBLIC BY DESIGN)" if s.public_by_design else ""
                 lines.append(f"  [{s.severity.upper()}] {s.kind}: {s.value}{flag}")
+
+        if self.decoded_secrets:
+            lines += ["", "Decoded secrets (from encoded JS literals):"]
+            for d in self.decoded_secrets:
+                lines.append(f"  [{d.severity.upper()}] {d.scheme} → {d.hint}: {d.decoded[:80]}")
 
         if self.source_maps:
             lines += ["", "Source maps:"]
@@ -299,7 +540,26 @@ class JSAnalysisResult:
         if self.dom_xss:
             lines += ["", "DOM XSS signals:"]
             for d in self.dom_xss:
-                lines.append(f"  [{d.priority}] {d.source} → {d.sink}  ({d.source_file})")
+                extra = f"  notes={','.join(d.notes)}" if d.notes else ""
+                lines.append(f"  [{d.priority}] {d.source} → {d.sink}  ({d.source_file}){extra}")
+
+        if self.dom_clobbering:
+            lines += ["", "DOM clobbering risks:"]
+            for c in self.dom_clobbering:
+                ident = f" ident={c.identifier}" if c.identifier else ""
+                lines.append(f"  [{c.priority}] {c.pattern}{ident}  ({c.source_file})")
+
+        if self.prototype_pollution:
+            lines += ["", "Prototype pollution sinks:"]
+            for p in self.prototype_pollution:
+                ui = " (near user input)" if p.near_user_input else ""
+                lines.append(f"  [{p.severity}] {p.sink}{ui}  ({p.source_file})")
+
+        if self.trusted_types:
+            lines += ["", "Trusted Types posture:"]
+            for t in self.trusted_types:
+                policy = ",".join(t.policy_names) if t.policy_names else "none"
+                lines.append(f"  {t.source_file}: policy={policy} violations={len(t.violations)}")
 
         tc = generate_test_cases(self)
         if tc:
@@ -373,7 +633,11 @@ class JSDeepAnalyzer:
         result.endpoints.extend(_extract_endpoints(content, fname))
         result.graphql_ops.extend(_extract_graphql(content, fname))
         result.secrets.extend(_extract_secrets(content, fname))
+        result.decoded_secrets.extend(_extract_decoded_secrets(content, fname))
         result.dom_xss.extend(_detect_dom_xss(content, fname))
+        result.dom_clobbering.extend(_detect_dom_clobbering(content, fname))
+        result.prototype_pollution.extend(_detect_prototype_pollution(content, fname))
+        result.trusted_types.append(_detect_trusted_types(content, fname))
         result.auth_smells.extend(_detect_auth_smells(content, fname))
         result.storage_usage.extend(_detect_storage(content, fname))
         result.websocket_urls.extend(_extract_websockets(content))
@@ -538,28 +802,121 @@ def _extract_graphql(content: str, fname: str) -> list[JSGraphQLOp]:
 
 
 def _extract_secrets(content: str, fname: str) -> list[JSSecret]:
+    """Scan JS bundle text for credential-shaped strings. Delegates to the
+    unified [[secrets]] catalog; only the JS-specific transform (truncation
+    + dedup) lives here."""
+    import secrets as _secrets  # local import — keeps module-level deps small
+
     found: list[JSSecret] = []
     seen: set[str] = set()
+    for m in _secrets.scan(content):
+        truncated = m.value[:8] + "…" if len(m.value) > 8 else m.value
+        key = f"{m.kind}:{truncated}"
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(JSSecret(
+            kind=m.kind, value=truncated, severity=m.severity,
+            public_by_design=m.public_by_design, source_file=fname,
+        ))
+    return found
 
-    for kind, pattern, severity, public_by_design, *_ in _SECRET_PATTERNS:
-        for m in pattern.finditer(content):
-            raw = m.group(0)
-            # Use first group if available (for context-based patterns)
-            try:
-                raw = m.group(1)
-            except IndexError:
-                pass
-            truncated = raw[:8] + "…" if len(raw) > 8 else raw
-            key = f"{kind}:{truncated}"
-            if key in seen:
+
+# String literals that could be encoded payloads. Bounded length keeps the
+# walk cheap on minified mega-bundles. The base64/base64url/hex/JWT charset
+# is a superset of what we actually decode — codec.detect() does the real
+# filtering with confidence scoring.
+_ENCODED_LITERAL_RE = re.compile(
+    r'''["'`]([A-Za-z0-9+/=_\-\.]{20,512})["'`]'''
+)
+
+_SECRET_KEYWORDS_RE = re.compile(
+    r'(secret|password|passwd|api[_-]?key|access[_-]?token|private[_-]?key|bearer)',
+    re.IGNORECASE,
+)
+
+
+def _extract_decoded_secrets(content: str, fname: str) -> list[JSDecodedSecret]:
+    """Walk encoded-looking literals through codec.detect/try_decode_all.
+    Surfaces base64/JWT/hex blobs that decode to URLs, JSON, JWT bodies, or
+    secret-shaped strings — material the regex-based _extract_secrets() misses
+    because the value was wrapped in an encoding layer."""
+    found: list[JSDecodedSecret] = []
+    seen: set[str] = set()
+
+    for m in _ENCODED_LITERAL_RE.finditer(content):
+        raw = m.group(1)
+        if raw in seen:
+            continue
+        seen.add(raw)
+
+        ranked = codec.detect(raw)
+        # Skip low-confidence guesses — minified variable name soup decodes
+        # to junk and would flood the output.
+        if not ranked or ranked[0][1] < 0.7:
+            continue
+
+        layers = codec.try_decode_all(raw, max_depth=2)
+        if not layers:
+            continue
+
+        for scheme, decoded in layers:
+            if not _looks_interesting(decoded):
                 continue
-            seen.add(key)
-            found.append(JSSecret(
-                kind=kind, value=truncated, severity=severity,
-                public_by_design=public_by_design, source_file=fname,
+            severity = _classify_decoded(decoded)
+            found.append(JSDecodedSecret(
+                original=raw[:32] + ("…" if len(raw) > 32 else ""),
+                scheme=scheme,
+                decoded=decoded[:200] + ("…" if len(decoded) > 200 else ""),
+                severity=severity,
+                hint=_hint_for(decoded),
+                source_file=fname,
             ))
+            break  # one row per literal — don't spam every nested layer
 
     return found
+
+
+def _looks_interesting(s: str) -> bool:
+    """A decoded blob is interesting if it's mostly printable AND carries
+    structure (URL, JSON, key=value, JWT header, etc). Random byte garbage
+    fails the printable ratio; minified identifier-like strings fail the
+    structure check."""
+    if not s or len(s) < 4:
+        return False
+    printable = sum(1 for c in s if 32 <= ord(c) < 127 or c in "\t\n\r")
+    if printable / len(s) < 0.85:
+        return False
+    return bool(re.search(
+        r'(https?://|^\{|^\[|/api/|/v\d+/|"alg"|"typ"|"iss"|\.com|\.io|\.net|=)',
+        s,
+    ))
+
+
+def _classify_decoded(s: str) -> str:
+    if 'BEGIN' in s and ('PRIVATE' in s or 'RSA' in s):
+        return "critical"
+    if _SECRET_KEYWORDS_RE.search(s):
+        return "high"
+    if 'https://' in s or 'http://' in s or '"alg"' in s:
+        return "medium"
+    return "low"
+
+
+def _hint_for(s: str) -> str:
+    if 'BEGIN' in s and 'KEY' in s:
+        return "private key material"
+    if s.startswith('{') and ('"alg"' in s or '"typ"' in s):
+        return "JWT header"
+    if s.startswith('{') and ('"iss"' in s or '"sub"' in s or '"exp"' in s):
+        return "JWT payload"
+    if s.startswith('http://') or s.startswith('https://'):
+        return "URL"
+    if s.startswith('{') or s.startswith('['):
+        return "JSON value"
+    if '=' in s and '\n' not in s:
+        return "config string"
+    return "decoded text"
 
 
 def _detect_dom_xss(content: str, fname: str) -> list[JSDomXss]:
@@ -615,6 +972,271 @@ def _detect_storage(content: str, fname: str) -> list[JSStorageUsage]:
         found.append(JSStorageUsage(storage_type=storage, key=key, operation=op, source_file=fname))
 
     return found
+
+
+def _detect_dom_clobbering(content: str, fname: str) -> list[JSDomClobbering]:
+    """Flag JS code patterns vulnerable to attacker-injected HTML elements
+    clobbering globals. Returns a list of JSDomClobbering findings."""
+    found: list[JSDomClobbering] = []
+    seen: set[tuple] = set()
+
+    # Track which identifiers appear in `window.X`-style reads so the truthy
+    # check pattern only fires when the same name is also read off window.
+    window_idents: set[str] = set()
+    for m in _DOMC_WINDOW_READ_RE.finditer(content):
+        ident = m.group(1) or m.group(2)
+        if ident and ident not in _WINDOW_BUILTINS:
+            window_idents.add(ident)
+
+    # 1. var x = window.x || ...  — high-signal fallback init.
+    for m in _DOMC_FALLBACK_RE.finditer(content):
+        ident = m.group(1)
+        key = ("window_fallback_init", ident)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(JSDomClobbering(
+            pattern="window_fallback_init",
+            matched_code=m.group(0),
+            identifier=ident,
+            source_file=fname,
+            priority="high",
+        ))
+
+    # 2. window.X reads (filtered by builtins allowlist).
+    for ident in sorted(window_idents):
+        key = ("window_named_read", ident)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(JSDomClobbering(
+            pattern="window_named_read",
+            matched_code=f"window.{ident}",
+            identifier=ident,
+            source_file=fname,
+            priority="low",
+        ))
+
+    # 3. document.X where X is not a known DOM API.
+    for m in _DOMC_DOC_NAMED_RE.finditer(content):
+        ident = m.group(1)
+        if ident in _DOM_API_ALLOWLIST:
+            continue
+        key = ("document_named_element", ident)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(JSDomClobbering(
+            pattern="document_named_element",
+            matched_code=m.group(0),
+            identifier=ident,
+            source_file=fname,
+            priority="medium",
+        ))
+
+    # 4. if (X) truthy checks that match a known window-read ident, without
+    # a `typeof X` guard within ±80 chars.
+    for m in _DOMC_TRUTHY_RE.finditer(content):
+        ident = m.group(1)
+        if ident not in window_idents:
+            continue
+        window_start = max(0, m.start() - 80)
+        window_end = min(len(content), m.end() + 80)
+        if f"typeof {ident}" in content[window_start:window_end]:
+            continue
+        key = ("truthy_check_clobberable", ident)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(JSDomClobbering(
+            pattern="truthy_check_clobberable",
+            matched_code=m.group(0),
+            identifier=ident,
+            source_file=fname,
+            priority="medium",
+        ))
+
+    # 5. document.getElementById("x").<prop> with prop not in element allowlist.
+    for m in _DOMC_GETBYID_PROP_RE.finditer(content):
+        elem_id, prop = m.group(1), m.group(2)
+        if prop in _ELEMENT_PROP_ALLOWLIST:
+            continue
+        key = ("getbyid_prop_chain", f"{elem_id}.{prop}")
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(JSDomClobbering(
+            pattern="getbyid_prop_chain",
+            matched_code=m.group(0),
+            identifier=f"{elem_id}.{prop}",
+            source_file=fname,
+            priority="medium",
+        ))
+
+    return found
+
+
+def _detect_prototype_pollution(content: str, fname: str) -> list[JSPrototypePollution]:
+    """Flag prototype-pollution sink usage. Severity is bumped to 'high' when
+    a user-input source (JSON.parse, req.body, location.*, etc.) appears
+    within ±300 chars of the sink."""
+    found: list[JSPrototypePollution] = []
+    seen: set[tuple] = set()
+
+    def _near_user_input(pos: int) -> bool:
+        window = content[max(0, pos - 300): pos + 300]
+        return bool(_USER_INPUT_HINT_RE.search(window))
+
+    def _emit(sink: str, target: Optional[str], matched: str, severity: str,
+              near: bool) -> None:
+        key = (sink, target, matched[:40])
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(JSPrototypePollution(
+            sink=sink, target=target, matched_code=matched,
+            near_user_input=near, severity=severity, source_file=fname,
+        ))
+
+    # 1. Direct __proto__ / constructor.prototype touches.
+    for m in _PROTO_LITERAL_RE.finditer(content):
+        near = _near_user_input(m.start())
+        sev = "high" if near else "medium"
+        _emit("proto_literal", None, m.group(0), sev, near)
+
+    # 2. lodash deep-merge / set family.
+    for m in _PROTO_LODASH_RE.finditer(content):
+        op = m.group(1)
+        near = _near_user_input(m.start())
+        sev = "high" if near or op in ("merge", "mergeWith", "defaultsDeep") else "medium"
+        _emit("lodash_merge", op, m.group(0), sev, near)
+
+    # 3. jQuery deep extend.
+    for m in _PROTO_JQ_EXTEND_RE.finditer(content):
+        near = _near_user_input(m.start())
+        sev = "high" if near else "medium"
+        _emit("jquery_extend_deep", None, m.group(0), sev, near)
+
+    # 4. Object.assign(target, src) — high severity only when target is `{}`
+    # AND source looks user-controlled.
+    for m in _PROTO_OBJECT_ASSIGN_RE.finditer(content):
+        target_raw = m.group(1).strip()
+        empty_target = target_raw.startswith("{")
+        near = _near_user_input(m.start())
+        if empty_target and near:
+            sev = "high"
+        elif empty_target or near:
+            sev = "medium"
+        else:
+            sev = "low"
+        _emit("object_assign", target_raw, m.group(0), sev, near)
+
+    # 5. Recursive merge loop: for (k in src) { dst[k] = src[k]; }
+    for m in _PROTO_RECURSIVE_MERGE_RE.finditer(content):
+        near = _near_user_input(m.start())
+        sev = "high" if near else "medium"
+        _emit("recursive_merge", None, m.group(0)[:80], sev, near)
+
+    # 6. Custom path-setter helpers (set(obj, "a.b.c", v)).
+    for m in _PROTO_PATH_SETTER_RE.finditer(content):
+        near = _near_user_input(m.start())
+        sev = "high" if near else "low"
+        _emit("path_setter", None, m.group(0), sev, near)
+
+    return found
+
+
+def _detect_trusted_types(content: str, fname: str) -> JSTrustedTypes:
+    """Return a per-file Trusted Types status object plus a list of nested
+    violations (sink usage without visible policy/sanitizer wrapping)."""
+    policy_names = list(dict.fromkeys(
+        m.group(1) for m in _TT_CREATE_POLICY_RE.finditer(content)
+    ))
+    has_policy = bool(policy_names)
+    has_default_policy = "default" in policy_names or bool(
+        re.search(r'defaultPolicy\b', content)
+    )
+    enforces_csp = bool(_TT_CSP_HINT_RE.search(content))
+
+    status = JSTrustedTypes(
+        source_file=fname,
+        has_policy=has_policy,
+        policy_names=policy_names,
+        has_default_policy=has_default_policy,
+        enforces_csp_hint=enforces_csp,
+    )
+
+    seen: set[tuple] = set()
+
+    def _emit(sink: str, match_obj, matched_text: str, priority: str) -> None:
+        # Wrap-detection: scan ±200 chars around the match for a sanitizer
+        # or TT policy call. has_policy_in_scope means "this file declared a
+        # policy AND we didn't see a wrap call near the sink".
+        window_start = max(0, match_obj.start() - 200)
+        window_end = min(len(content), match_obj.end() + 200)
+        window = content[window_start:window_end]
+        if _TT_WRAP_RE.search(matched_text) or _TT_WRAP_RE.search(window):
+            return  # value looks wrapped — skip
+        key = (sink, matched_text[:60])
+        if key in seen:
+            return
+        seen.add(key)
+        status.violations.append(JSTrustedTypesViolation(
+            sink=sink,
+            has_policy_in_scope=has_policy,
+            matched_code=matched_text[:120],
+            priority=priority,
+            source_file=fname,
+        ))
+
+    # Map _SINKS to TT sink names. Skip dangerouslySetInnerHTML and document.write
+    # — handled below with sink-specific RHS extraction.
+    _SINK_PRIORITY = {
+        "innerHTML": "high",
+        "outerHTML": "high",
+        "insertAdjacentHTML": "high",
+        "document.write": "high",
+        "eval": "high",
+        "new Function": "high",
+        "location.href=": "medium",
+        "setTimeout-str": "medium",
+    }
+    for sink_name, sink_pat in _SINKS:
+        if sink_name == "dangerouslySetInnerHTML":
+            continue  # handled separately via _TT_REACT_DSI_RE
+        priority = _SINK_PRIORITY.get(sink_name, "medium")
+        for m in re.finditer(sink_pat, content):
+            _emit(sink_name, m, m.group(0), priority)
+
+    # React's compiled JSX form needs an RHS-aware check.
+    for m in _TT_REACT_DSI_RE.finditer(content):
+        rhs = m.group(1).strip()
+        if _TT_WRAP_RE.search(rhs):
+            continue
+        # String literal → low; bare identifier → medium; function call → high.
+        if rhs.startswith(("'", '"', '`')):
+            priority = "low"
+        elif rhs.endswith(")"):
+            priority = "high"
+        else:
+            priority = "medium"
+        _emit("dangerouslySetInnerHTML", m, m.group(0), priority)
+
+    # Worker(stringURL) and elem.src = userUrl — TT-relevant beyond DOM XSS.
+    for m in _TT_WORKER_RE.finditer(content):
+        rhs = m.group(1).strip()
+        if rhs.startswith(("'", '"', '`')):
+            continue  # static URL literal — not a TT concern
+        _emit("worker", m, m.group(0), "high")
+
+    for m in _TT_SCRIPT_SRC_RE.finditer(content):
+        rhs = m.group(1).strip()
+        # Skip string literals — only variable/expression assignments are TT-relevant.
+        if rhs.startswith(("'", '"', '`')):
+            continue
+        _emit("script_src_assign", m, m.group(0), "medium")
+
+    return status
 
 
 def _extract_websockets(content: str) -> list[str]:
@@ -775,6 +1397,70 @@ def _deduplicate(result: JSAnalysisResult) -> None:
     result.feature_flags = list(dict.fromkeys(result.feature_flags))
     result.debug_flags = list(dict.fromkeys(result.debug_flags))
 
+    seen_dec: set[str] = set()
+    decs = []
+    severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    for d in result.decoded_secrets:
+        k = f"{d.scheme}:{d.original}"
+        if k not in seen_dec:
+            seen_dec.add(k)
+            decs.append(d)
+    result.decoded_secrets = sorted(decs, key=lambda d: severity_rank.get(d.severity, 9))
+
+    # DOM clobbering — dedup by (pattern, identifier, source_file).
+    seen_dc: set[tuple] = set()
+    dcs = []
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    for c in result.dom_clobbering:
+        k = (c.pattern, c.identifier, c.source_file)
+        if k not in seen_dc:
+            seen_dc.add(k)
+            dcs.append(c)
+    result.dom_clobbering = sorted(dcs, key=lambda c: priority_rank.get(c.priority, 9))
+
+    # Prototype pollution — dedup by (sink, source_file, matched_code prefix).
+    seen_pp: set[tuple] = set()
+    pps = []
+    for p in result.prototype_pollution:
+        k = (p.sink, p.source_file, p.matched_code[:40])
+        if k not in seen_pp:
+            seen_pp.add(k)
+            pps.append(p)
+    result.prototype_pollution = sorted(pps, key=lambda p: severity_rank.get(p.severity, 9))
+
+    # Trusted Types ↔ DOM XSS enrichment: when both detectors fire on the
+    # same (sink, source_file), annotate the DOM XSS finding and drop the
+    # duplicate TT violation. DOM XSS uses different sink labels for some
+    # entries — map TT sink → DOM XSS sink names here.
+    _TT_TO_XSS_SINK = {
+        "innerHTML": "innerHTML",
+        "outerHTML": "outerHTML",
+        "insertAdjacentHTML": "insertAdjacentHTML",
+        "document.write": "document.write",
+        "eval": "eval",
+        "new Function": "new Function",
+        "setTimeout-str": "setTimeout-str",
+        "location.href=": "location.href=",
+        "dangerouslySetInnerHTML": "dangerouslySetInnerHTML",
+    }
+    # Index DOM XSS findings for fast lookup.
+    xss_by_key: dict[tuple, JSDomXss] = {}
+    for x in result.dom_xss:
+        xss_by_key.setdefault((x.sink, x.source_file), x)
+
+    for tt in result.trusted_types:
+        kept: list[JSTrustedTypesViolation] = []
+        for v in tt.violations:
+            xss_sink = _TT_TO_XSS_SINK.get(v.sink)
+            paired = xss_by_key.get((xss_sink, v.source_file)) if xss_sink else None
+            if paired is not None:
+                if not v.has_policy_in_scope and "no_tt_policy" not in paired.notes:
+                    paired.notes.append("no_tt_policy")
+                paired.priority = "high"
+                continue  # drop the duplicate TT violation
+            kept.append(v)
+        tt.violations = kept
+
 
 # ---------------------------------------------------------------------------
 # Test case generator
@@ -839,6 +1525,46 @@ def generate_test_cases(result: JSAnalysisResult) -> list[dict]:
                     f"Inject <img src=x onerror=alert(1)> via {dom.source}",
                     f"Test: ?param=<svg/onload=alert(1)> and check if {dom.sink} reflects it",
                     "Try hash-based injection if source is location.hash",
+                ],
+            })
+
+    for clob in result.dom_clobbering:
+        if clob.priority != "high":
+            continue
+        ident = clob.identifier or "X"
+        cases.append({
+            "priority": "high", "title": f"DOM clobbering: window.{ident}",
+            "steps": [
+                f"Inject <a id='{ident}' href='javascript:alert(1)'> into any sink that allows HTML",
+                f"Test <form id='{ident}'><input name='url' value='...'></form> to clobber window.{ident}.url",
+                f"Verify the code uses `typeof {ident} === 'undefined'` guard, not truthy check",
+            ],
+        })
+
+    for proto in result.prototype_pollution:
+        if proto.severity != "high":
+            continue
+        cases.append({
+            "priority": "high", "title": f"Prototype pollution: {proto.sink}",
+            "steps": [
+                "Send request body with: {\"__proto__\":{\"polluted\":1}}",
+                "Send: {\"constructor\":{\"prototype\":{\"polluted\":1}}}",
+                "After the request, evaluate `({}.polluted === 1)` in DevTools — true means polluted",
+                f"Target the {proto.sink} sink with attacker-controlled keys",
+            ],
+        })
+
+    for tt in result.trusted_types:
+        for v in tt.violations:
+            if v.priority != "high":
+                continue
+            cases.append({
+                "priority": "high",
+                "title": f"Trusted Types violation: {v.sink} (policy={'yes' if tt.has_policy else 'no'})",
+                "steps": [
+                    f"Verify CSP includes `require-trusted-types-for 'script'` for this page",
+                    f"Inject HTML at the {v.sink} sink; observe TypeError if TT enforced, successful injection if not",
+                    "If a policy exists, audit its createHTML/createScript for naive pass-through",
                 ],
             })
 

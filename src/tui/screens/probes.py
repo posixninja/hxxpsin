@@ -21,6 +21,7 @@ _PROBE_TABS = [
     ("upload",       "Upload",       ["endpoint", "test_name", "verdict"]),
     ("dom_xss",      "DOM XSS",      ["url", "source", "sink", "verdict"]),
     ("access_replay","Access Replay",["url", "original_status", "new_status", "bypass_source"]),
+    ("dns_recon",    "DNS Recon",    ["url", "category", "verdict"]),
     ("ws",           "WebSocket",    ["url", "category", "severity"]),
     ("auto_fuzz",    "AutoFuzz",     ["url", "position", "payload", "anomaly"]),
 ]

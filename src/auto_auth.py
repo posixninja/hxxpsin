@@ -23,10 +23,21 @@ import re
 import string
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
+
+try:
+    import captcha as _captcha
+except ImportError:  # pragma: no cover — captcha module ships with the project
+    _captcha = None  # type: ignore[assignment]
+
+try:
+    import mailbox as _mailbox
+except ImportError:  # pragma: no cover
+    _mailbox = None  # type: ignore[assignment]
 
 
 # Common register endpoint paths
@@ -107,6 +118,7 @@ class _FormShape:
     field_names: list[str]
     password_count: int
     is_register: bool
+    captcha: Optional[object] = None  # captcha.CaptchaSignal — set if page had one
 
 # Mailhog/Mailpit/Mailcatcher API ports — used to grab verification OTPs and links
 _MAIL_API_PORTS = (8025, 1080, 8026, 8030)
@@ -140,6 +152,11 @@ class AuthSession:
     login_shape: str = ""
     register_succeeded: bool = False
     login_succeeded: bool = False
+    mfa_required: bool = False
+    mfa_succeeded: bool = False
+    mfa_method: str = ""  # "email-otp" | "totp" | "magic-link"
+    captcha_kind: str = ""  # e.g. "recaptcha-v2" if a captcha was solved
+    captcha_solved: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -168,6 +185,15 @@ class AuthSession:
                 "url": self.login_url, "status": self.login_status,
                 "shape": self.login_shape, "succeeded": self.login_succeeded,
             },
+            "mfa": {
+                "required": self.mfa_required,
+                "succeeded": self.mfa_succeeded,
+                "method": self.mfa_method,
+            },
+            "captcha": {
+                "kind": self.captcha_kind,
+                "solved": self.captcha_solved,
+            },
             "notes": self.notes,
         }
 
@@ -182,7 +208,11 @@ class AutoAuth:
                  email_domain: Optional[str] = None,
                  email: Optional[str] = None,
                  password: Optional[str] = None,
-                 username: Optional[str] = None):
+                 username: Optional[str] = None,
+                 mail_backend=None,
+                 captcha_solver=None,
+                 totp_secret: Optional[str] = None,
+                 manual_snapshot_path: Optional[Path] = None):
         """Initialise AutoAuth.
 
         - If `email`+`password` are both supplied, AutoAuth uses those creds
@@ -190,16 +220,22 @@ class AutoAuth:
           Login attempts run as normal.
         - Otherwise AutoAuth generates a random account and tries to register
           it. `email_domain` controls the random email's domain.
+
+        - `mail_backend` (mailbox.MailBackend) drives email verification + OTP
+          fetching. When None, falls back to the legacy local-mailhog probe.
+        - `captcha_solver` (captcha.CaptchaSolver) handles forms flagged as
+          captcha-protected. When None, captcha-tagged forms are skipped.
+        - `totp_secret` (base32) generates app-TOTP codes via pyotp on 2FA
+          challenges instead of polling mail.
         """
         self.target = target.rstrip("/")
         self.timeout = timeout
-        # `.test` is RFC 2606-reserved and rejected by many real-world signup
-        # validators. Default to a registrable .com that's plausibly disposable
-        # (still won't pass validators that actually verify MX, but passes the
-        # syntax + TLD-blocklist checks that 95% of sites use). Operator can
-        # override with --auth-email-domain to point at a real inbox they
-        # control (e.g. mailinator subdomain or a domain they own).
         self._email_domain = (email_domain or "hxxpsin-pentest.com").strip().lstrip("@")
+        self._mail_backend = mail_backend
+        self._captcha_solver = captcha_solver
+        self._totp_secret = (totp_secret or "").strip() or None
+        self._manual_snapshot_path = manual_snapshot_path
+
         # If operator supplied real creds, use them and skip registration.
         if email and password:
             local_part = email.split("@", 1)[0] if "@" in email else email
@@ -234,7 +270,27 @@ class AutoAuth:
         js_routes: Optional[list[str]] = None,
     ) -> AuthSession:
         """Discover endpoints, register, login, verify. Returns AuthSession."""
+        # If the mail backend provisions disposable inboxes (mail.tm), grab
+        # one now and use that address as the registration email. Skip when
+        # operator supplied real creds.
+        provisioned_note: Optional[str] = None
+        if (
+            self._mail_backend is not None
+            and getattr(self._mail_backend, "provisions_inbox", False)
+            and not self._skip_register
+        ):
+            try:
+                addr, pw = await self._mail_backend.create_inbox()
+                self._creds = Credentials(
+                    username=self._creds.username, email=addr, password=pw,
+                )
+                provisioned_note = f"using disposable inbox: {addr}"
+            except Exception as exc:
+                provisioned_note = f"disposable inbox provisioning failed: {exc}"
+
         session = AuthSession(credentials=self._creds)
+        if provisioned_note:
+            session.notes.append(provisioned_note)
 
         register_urls, login_urls = self._discover_endpoints(classifier_result, js_routes)
 
@@ -322,6 +378,12 @@ class AutoAuth:
 
             # ── Try discovered login forms first ──────────────────────────
             for f in [x for x in forms if not x.is_register]:
+                # Captcha-tagged form → hand off to solver before brute submit
+                if f.captcha and self._captcha_solver is not None:
+                    if await self._solve_captcha(f, session):
+                        break
+                    # Solver couldn't resolve it — fall through to brute attempt anyway
+                login_started_at = time.time()
                 r = await self._submit_form(client, f)
                 if r is None:
                     continue
@@ -332,6 +394,17 @@ class AutoAuth:
                     location = r.headers.get("location", "").lower()
                     if "error" in location or "fail" in location:
                         cookies = {}
+                # Detect 2FA challenge — login looks "successful" but server is waiting
+                if not (token or cookies) and self._detect_2fa(r):
+                    jar_cookies = self._extract_auth_cookies_from_jar(client)
+                    session.cookies.update(jar_cookies)
+                    await self._resolve_mfa(client, session, login_started_at)
+                    if session.mfa_succeeded:
+                        session.login_url = f.action_url
+                        session.login_status = r.status_code
+                        session.login_shape = f"html_form+mfa ({session.mfa_method})"
+                        session.login_succeeded = True
+                        break
                 if token or cookies:
                     jar_cookies = self._extract_auth_cookies_from_jar(client)
                     session.login_url = f.action_url
@@ -366,6 +439,17 @@ class AutoAuth:
                         break
                     elif status:
                         session.notes.append(f"login {url} failed: status={status}")
+
+            # ── Post-login 2FA resolution (when brute-force path succeeded
+            # but auth probe later fails, or when login response itself was
+            # an MFA challenge that _try_login couldn't see) ──────────────
+            if session.login_succeeded and not session.mfa_required \
+                    and (self._totp_secret or self._mail_backend is not None):
+                # Cheap probe — does /me / /profile work now? If not, retry
+                # treating it as a possible silent MFA gate.
+                probe = await self._verify_auth(client, session)
+                if not probe:
+                    await self._resolve_mfa(client, session, login_started_at=time.time() - 30)
 
             # ── Verify the harvested auth actually works ──────────────────
             if session.has_auth:
@@ -412,10 +496,26 @@ class AutoAuth:
         return out
 
     async def _check_mailbox(
-        self, client: httpx.AsyncClient
+        self, client: httpx.AsyncClient,
+        since: float = 0.0,
+        timeout: float = 20.0,
     ) -> tuple[Optional[str], Optional[str]]:
-        """Poll local mailhog/mailpit ports for an email to our address.
-        Returns (otp_code, verification_link)."""
+        """Poll mail backend (if injected) or fall back to local mailhog/mailpit
+        port probes. Returns (otp_code, verification_link)."""
+        # Prefer the injected backend — supports IMAP / mail.tm / configured mailhog
+        if self._mail_backend is not None and _mailbox is not None:
+            try:
+                msg = await self._mail_backend.wait_for(
+                    self._creds.email, since=since, timeout=timeout,
+                )
+            except Exception as exc:  # backend failures shouldn't kill the scan
+                return None, None
+            if msg is None:
+                return None, None
+            v = _mailbox.extract_verification(msg)
+            return v.otp, v.link
+
+        # Legacy auto-host mailhog probe (vm/ test stack)
         host = urlparse(self.target).hostname or "localhost"
         for port in _MAIL_API_PORTS:
             mail_url = f"http://{host}:{port}/api/v2/messages"
@@ -493,6 +593,162 @@ class AutoAuth:
                     except httpx.HTTPError:
                         continue
         return None
+
+    # ----------------------------------------------------------------------
+    # 2FA / MFA challenge handling — runs after a successful login
+    # ----------------------------------------------------------------------
+
+    _MFA_BODY_RE = re.compile(
+        r'(?:"(?:otp_required|mfa_required|two_factor|2fa|requires_mfa|'
+        r'challenge_required|verify_required|need_otp)"|'
+        r'mfa.{0,10}(?:required|enabled)|two[\s_-]?factor|verification\s+code\s+sent)',
+        re.IGNORECASE,
+    )
+    _MFA_REDIRECT_RE = re.compile(r"/(?:2fa|mfa|otp|verify(?:-otp)?|challenge|two[-_]?factor)(?:[/?]|$)", re.IGNORECASE)
+    _MFA_VERIFY_PATHS = [
+        "/api/auth/verify-otp", "/api/auth/2fa", "/api/auth/mfa/verify",
+        "/api/v1/auth/2fa", "/api/v1/auth/verify",
+        "/api/2fa/verify", "/api/mfa/verify", "/api/otp/verify",
+        "/auth/2fa", "/auth/verify-otp", "/auth/mfa",
+        "/2fa", "/mfa/verify", "/verify-otp", "/login/verify",
+    ]
+
+    def _detect_2fa(self, r: httpx.Response) -> bool:
+        """True if `r` looks like a 2FA challenge response after login."""
+        # Redirect into a 2FA path
+        if r.status_code in (302, 303):
+            loc = r.headers.get("location", "")
+            if self._MFA_REDIRECT_RE.search(loc):
+                return True
+        if r.status_code in (200, 401, 403):
+            body = r.text[:2000] if r.text else ""
+            if body and self._MFA_BODY_RE.search(body):
+                return True
+        # Some APIs return 200 + specific status field
+        try:
+            data = r.json()
+        except (json.JSONDecodeError, ValueError):
+            return False
+        flat = json.dumps(data)[:2000].lower()
+        return bool(self._MFA_BODY_RE.search(flat))
+
+    def _totp_code(self) -> Optional[str]:
+        """Generate a TOTP code from the configured base32 secret. Returns None
+        if pyotp isn't installed or no secret was supplied."""
+        if not self._totp_secret:
+            return None
+        try:
+            import pyotp  # noqa: WPS433 — optional dep, only loaded when needed
+        except ImportError:
+            return None
+        try:
+            return pyotp.TOTP(self._totp_secret).now()
+        except (ValueError, TypeError):
+            return None
+
+    async def _submit_2fa_code(
+        self, client: httpx.AsyncClient, code: str,
+    ) -> Optional[str]:
+        """POST the 2FA code to common verification endpoints. Returns evidence
+        string on apparent success, None otherwise."""
+        shapes = [
+            {"otp": code}, {"code": code}, {"token": code},
+            {"otp": code, "email": self._creds.email},
+            {"code": code, "username": self._creds.username},
+            {"verification_code": code},
+            {"mfa_code": code},
+        ]
+        for path in self._MFA_VERIFY_PATHS:
+            url = self.target + path
+            for body in shapes:
+                try:
+                    r = await client.post(url, json=body)
+                    if r.status_code in (200, 201, 204):
+                        text = r.text[:300].lower()
+                        if any(e in text for e in ("error", "invalid", "expired", "wrong", "denied")):
+                            continue
+                        return f"POST {path} → {r.status_code}"
+                except httpx.HTTPError:
+                    continue
+        return None
+
+    async def _resolve_mfa(
+        self, client: httpx.AsyncClient, session: AuthSession,
+        login_started_at: float,
+    ) -> None:
+        """Try TOTP first (instant), fall back to polling the inbox for an
+        email-delivered OTP. Updates session.mfa_* in place."""
+        session.mfa_required = True
+
+        # Path 1: app-TOTP from operator-supplied secret
+        code = self._totp_code()
+        if code:
+            evidence = await self._submit_2fa_code(client, code)
+            if evidence:
+                session.mfa_succeeded = True
+                session.mfa_method = "totp"
+                # Refresh cookies after MFA — server may have rotated session
+                session.cookies.update(self._extract_auth_cookies_from_jar(client))
+                session.notes.append(f"MFA solved via TOTP — {evidence}")
+                return
+            session.notes.append("MFA: TOTP code rejected, falling back to mailbox")
+
+        # Path 2: email-OTP — poll mailbox for a code arrived since login started
+        otp, link = await self._check_mailbox(client, since=login_started_at, timeout=30.0)
+        if link:
+            try:
+                r = await client.get(link)
+                if r.status_code in (200, 302, 303):
+                    session.mfa_succeeded = True
+                    session.mfa_method = "magic-link"
+                    session.cookies.update(self._extract_auth_cookies_from_jar(client))
+                    session.notes.append(f"MFA solved via magic-link → {r.status_code}")
+                    return
+            except httpx.HTTPError:
+                pass
+        if otp:
+            evidence = await self._submit_2fa_code(client, otp)
+            if evidence:
+                session.mfa_succeeded = True
+                session.mfa_method = "email-otp"
+                session.cookies.update(self._extract_auth_cookies_from_jar(client))
+                session.notes.append(f"MFA solved via email-OTP — {evidence}")
+                return
+            session.notes.append(f"MFA: email OTP {otp[:2]}*** found but verify endpoints rejected it")
+        else:
+            session.notes.append("MFA: no OTP found in mailbox within timeout")
+
+    # ----------------------------------------------------------------------
+    # Captcha handoff
+    # ----------------------------------------------------------------------
+
+    async def _solve_captcha(
+        self, form: _FormShape, session: AuthSession,
+    ) -> bool:
+        """Hand off to the configured captcha solver. Populates session on
+        success. Returns True if auth was captured."""
+        if not (self._captcha_solver and form.captcha):
+            return False
+        solved = await self._captcha_solver.solve(
+            page_url=form.page_url,
+            signal=form.captcha,
+        )
+        if not solved or not solved.has_auth:
+            session.notes.append(
+                f"captcha {form.captcha.kind} on {form.page_url}: solver returned no auth"
+            )
+            return False
+        session.cookies.update(solved.cookies)
+        if solved.bearer_token:
+            session.token = solved.bearer_token
+        session.login_url = form.action_url
+        session.login_shape = f"captcha-solved ({form.captcha.kind})"
+        session.login_succeeded = True
+        session.captcha_kind = form.captcha.kind
+        session.captcha_solved = True
+        for note in solved.notes:
+            session.notes.append("captcha: " + note)
+        return True
 
     # ----------------------------------------------------------------------
     # HTML form discovery — scrape real forms before brute-forcing body shapes
@@ -587,6 +843,9 @@ class AutoAuth:
             if "html" not in ct:
                 continue
 
+            # Detect captcha once per page — tagged on every form found on it
+            page_captcha = _captcha.detect(r.text) if _captcha else None
+
             for fm in _FORM_BLOCK_RE.finditer(r.text):
                 form_attrs = _parse_attrs(fm.group(1))
                 inputs: list[tuple[str, str, str]] = []  # (name, type, default_value)
@@ -645,6 +904,7 @@ class AutoAuth:
                     page_url=page_url, action_url=action_url, method=method, enctype=enctype,
                     fields=fields, field_names=[n for n, _, _ in inputs],
                     password_count=pw_count, is_register=is_register,
+                    captcha=page_captcha,
                 ))
         return forms
 

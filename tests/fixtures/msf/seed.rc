@@ -1,0 +1,54 @@
+# msfconsole resource script — populates the hxxpsin-test workspace with
+# enough data that msf_ingest has hosts, services, creds, notes, and loot
+# to merge. (Vulns get inserted via direct SQL in seed.sh because this
+# version of msfconsole's `vulns` command is read-only — vulns are
+# normally written by exploit modules, not the CLI.)
+#
+# Run via:
+#   tests/fixtures/msf/seed.sh
+# which handles the msfconsole + psql legs in sequence.
+
+db_disconnect
+db_connect msf:msfpass@db:5432/msf
+
+workspace -a hxxpsin-test
+workspace hxxpsin-test
+
+# Scan the target container to populate hosts + the port-80 service.
+# -Pn skips ICMP (DVWA's container doesn't respond to ping), -sT is a
+# TCP connect scan so we don't need NET_RAW.
+db_nmap -Pn -sT -p 80 172.28.0.10
+
+# Round out the service table with three more "open" rows so ingest
+# tests see a representative spread. Modern syntax: flags first, host last.
+services -a -p 443  -r tcp -s https 172.28.0.10
+services -a -p 22   -r tcp -s ssh   172.28.0.10
+services -a -p 3306 -r tcp -s mysql 172.28.0.10
+
+# Credentials — the modern `creds add` syntax. These end up in the
+# global credential tables (publics/privates/credentials) and get filtered
+# back to the workspace when MSF RPC's db.creds is called.
+creds add user:admin   password:password
+creds add user:gordonb password:abc123
+creds add user:1337    password:charley
+
+# Notes — `-n` is the data string in this MSF version (not -d).
+# These are the rows msf_ingest.fetch_notes will pull and convert into
+# SecretRecord(type_hint="msf_note:<ntype>") entries.
+notes -a -t dns_enum -n "target.hxxpsin.test A 172.28.0.10" 172.28.0.10
+notes -a -t auth     -n "weak http basic auth on /admin"    172.28.0.10
+
+# Loot needs a real file on disk. seed.sh writes /tmp/seed-loot.txt into
+# the msf container before invoking this script — msfconsole's `!` shell
+# escape is disabled in this image, so we can't create the file inline.
+loot -a -f /tmp/seed-loot.txt -i "fake config dump" -t webapp.config 172.28.0.10
+
+# Confirm what landed
+workspace
+hosts
+services
+creds
+notes
+loot
+
+exit -y

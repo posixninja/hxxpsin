@@ -85,6 +85,18 @@ _HEADER_SURFACES = (
 _JS_URI_RE = re.compile(r"^\s*javascript:", re.IGNORECASE)
 _DATA_URI_RE = re.compile(r"^\s*data:", re.IGNORECASE)
 
+# Non-http(s) URI schemes that, if reflected into Location, indicate the
+# server does not normalize the redirect target's scheme. Each enables a
+# distinct pivot: file/jar/netdoc → local-file read by server-side fetchers
+# or some HTTP clients; gopher/dict/ldap → arbitrary TCP-ish chatter through
+# curl-family libs; ftp/sftp/telnet → legacy-protocol clients; news/nntp/imap
+# → mail/news pivot for stack-specific bugs.
+_ALT_SCHEME_RE = re.compile(
+    r"^\s*(file|ftp|sftp|telnet|gopher|dict|ldap|ldaps|jar|netdoc|"
+    r"news|nntp|imap|tftp|smb|smbs|ssh)\s*:",
+    re.IGNORECASE,
+)
+
 # Body-side redirect indicators
 _META_REFRESH_RE = re.compile(
     r'content=["\'][^"\']*url=([^"\';\s]+)', re.IGNORECASE
@@ -182,6 +194,29 @@ _BYPASS_TEMPLATES: dict[str, str] = {
     "javascript-tab":       "java%09script:alert(1)",
     "javascript-newline":   "java%0Ascript:alert(1)",
     "data-uri":             "data:text/html,<script>alert(1)</script>",
+
+    # Alt-scheme bypass — the redirect target uses a non-http(s) URI scheme.
+    # If the server reflects these into Location without scheme validation,
+    # the target is reachable for: server-side file reads (file://), SSRF
+    # pivots via curl-family clients (gopher/dict/ldap), and legacy-protocol
+    # clients (ftp/sftp/telnet). {C} is the canary host; file:// variants
+    # don't need it.
+    "alt-file-unix":        "file:///etc/passwd",
+    "alt-file-win":         "file:///c:/windows/win.ini",
+    "alt-file-smb":         "file://{C}/share/x",
+    "alt-ftp":              "ftp://{C}/",
+    "alt-ftp-auth":         "ftp://anonymous:guest@{C}/",
+    "alt-sftp":             "sftp://{C}:22/",
+    "alt-telnet":           "telnet://{C}:23/",
+    "alt-gopher":           "gopher://{C}:70/_GET%20/",
+    "alt-dict":             "dict://{C}:11211/stats",
+    "alt-ldap":             "ldap://{C}/cn=read",
+    "alt-jar":              "jar:https://{C}!/",
+    "alt-netdoc":           "netdoc://{C}/",
+    "alt-tftp":             "tftp://{C}/x",
+    "alt-news":             "news://{C}/x",
+    "alt-imap":             "imap://{C}/x",
+    "alt-ssh":              "ssh://{C}:22/",
 
     # Encoding evasion
     "backslash":            "/\\{C}/",
@@ -381,11 +416,19 @@ class OpenRedirectProbe:
         timeout: float = 8.0,
         browser_verifier=None,
         probe_headers: bool = True,
+        payload_server=None,
+        public_url: Optional[str] = None,
     ):
         self.auth_headers = auth_headers or {}
         self.timeout = timeout
         self.browser_verifier = browser_verifier
         self.probe_headers = probe_headers
+        self.payload_server = payload_server
+        self.public_url = (public_url or "").rstrip("/") or None
+        # Token shared across the entire run — every probe payload routes here
+        self._oob_token: Optional[str] = None
+        if self.payload_server and self.public_url:
+            self._oob_token = self.payload_server.mint_token("redirect")
 
     async def run(self, findings) -> OpenRedirectResult:
         result = OpenRedirectResult()
@@ -448,7 +491,53 @@ class OpenRedirectProbe:
         if self.browser_verifier and getattr(self.browser_verifier, "available", False):
             await self._browser_upgrade(result, live_targets)
 
+        # OOB confirmation pass — re-fire each "confirmed" finding with our
+        # public tunnel URL as the redirect target. Server-side redirect
+        # validators (OAuth flows, URL-preview features) will actually fetch
+        # the URL, which lands as a hit on payload_server. Client-side
+        # redirects won't — that's expected and just doesn't upgrade.
+        if self._oob_token and result.findings:
+            await self._oob_confirm(result)
+
         return result
+
+    async def _oob_confirm(self, result: OpenRedirectResult) -> None:
+        """For each confirmed finding, issue one extra probe with the tunnel
+        URL substituted in. If we see an inbound hit, attach OOB evidence."""
+        if not (self.payload_server and self.public_url and self._oob_token):
+            return
+        # Build a fresh httpx client so the OOB probes share a connection pool
+        async with httpx.AsyncClient(
+            verify=False, follow_redirects=False,
+            timeout=self.timeout, headers=self.auth_headers,
+        ) as client:
+            for finding in [f for f in result.findings if getattr(f, "verdict", "") == "confirmed"]:
+                target_url = getattr(finding, "url", "") or getattr(finding, "endpoint", "")
+                param = getattr(finding, "param", "")
+                if not target_url or not param:
+                    continue
+                payload = f"{self.public_url}/r/{self._oob_token}"
+                try:
+                    await client.get(
+                        target_url, params={param: payload}, follow_redirects=True,
+                    )
+                except (httpx.HTTPError, httpx.TimeoutException):
+                    pass
+        await asyncio.sleep(2.0)
+        hits = self.payload_server.hits_for(self._oob_token)
+        if not hits:
+            return
+        # Tag every confirmed finding (we can't perfectly attribute one hit
+        # to one finding — the tunnel URL is shared)
+        for f in result.findings:
+            if getattr(f, "verdict", "") != "confirmed":
+                continue
+            ev = getattr(f, "evidence", "")
+            f.evidence = (
+                (ev + " — " if ev else "")
+                + f"OOB confirmed: server-side fetched tunnel URL "
+                + f"({len(hits)} hit(s) from {hits[0].peer})"
+            )
 
     async def _baseline_check(self, client: httpx.AsyncClient, t: _Target
                                 ) -> tuple[str, Optional[int]]:
@@ -497,9 +586,12 @@ class OpenRedirectProbe:
             except httpx.InvalidURL:
                 # httpx parses the response's Location header even with
                 # follow_redirects=False, and barfs on non-http(s) schemes.
-                # For javascript-* / data-* payloads, that crash IS the signal:
-                # the server reflected an unsafe scheme into Location. Covers
-                # mixed-case, tab-injected, and newline-injected variants.
+                # For javascript-*, data-*, alt-* payloads the crash IS the
+                # signal: the server reflected an unsafe scheme into Location.
+                # alt-* schemes get lower confidence (0.7) because the same
+                # InvalidURL can fire on truly malformed Locations unrelated
+                # to our payload; js/data get 0.85 since the scheme is the
+                # smoking gun.
                 if bypass_class.startswith(("javascript-", "data-")):
                     hits.append(RedirectFinding(
                         url=t.url, method=t.method, surface=t.surface,
@@ -507,6 +599,16 @@ class OpenRedirectProbe:
                         verdict="confirmed", confidence=0.85,
                         evidence=(f"server reflected {bypass_class} scheme into "
                                   f"Location (httpx URL parse error)"),
+                        redirect_target="<unparseable scheme>",
+                    ))
+                elif bypass_class.startswith("alt-"):
+                    hits.append(RedirectFinding(
+                        url=t.url, method=t.method, surface=t.surface,
+                        param=t.param, payload=payload, bypass_class=bypass_class,
+                        verdict="likely", confidence=0.7,
+                        evidence=(f"server likely reflected {bypass_class} "
+                                  f"scheme into Location (httpx URL parse "
+                                  f"error on response)"),
                         redirect_target="<unparseable scheme>",
                     ))
                 continue
@@ -648,6 +750,22 @@ def _check_response(t: _Target, payload: str, bypass_class: str,
         return mk("confirmed", 0.95, "javascript: URI in Location header", location)
     if location and _DATA_URI_RE.match(location):
         return mk("confirmed", 0.95, "data: URI in Location header", location)
+
+    # 1b. Alt-scheme URI in Location — file/ftp/gopher/dict/ldap/jar/...
+    #     Confirmed when our exact alt-scheme payload made it through (canary
+    #     host or scheme prefix match); otherwise likely (the server returned
+    #     SOME non-http scheme but maybe not ours).
+    if location and _ALT_SCHEME_RE.match(location):
+        scheme = location.split(":", 1)[0].strip().lower()
+        if _CANARY in location or location.strip().lower().startswith(
+            payload.strip().lower()[: min(len(payload), 12)]
+        ):
+            return mk("confirmed", 0.9,
+                      f"{scheme}: URI in Location header (alt-scheme bypass)",
+                      location)
+        return mk("likely", 0.55,
+                  f"{scheme}: URI in Location header (server emits non-http scheme)",
+                  location)
 
     # 2. CRLF injection — Location header containing literal CR/LF means
     #    upstream didn't sanitize and we can split the response.

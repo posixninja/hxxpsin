@@ -123,6 +123,40 @@ class WizardScreen(Screen[dict | None]):
                     yield Checkbox("Allow writes", id="chk-writes")
                     yield Checkbox("Headed browser", id="chk-headed")
 
+                yield Label("── Stage 0: Surface mapper ────────────────", classes="section-header", markup=False)
+                with Horizontal(classes="check-row"):
+                    yield Checkbox("Auto scope", id="chk-auto-scope")
+                    yield Checkbox("Analyze block", id="chk-analyze-block")
+                with Horizontal(classes="field-row"):
+                    yield Label("Port scan:", markup=False)
+                    yield Input(value="none", placeholder="none | web | full", id="inp-port-scan")
+
+                yield Label("── OOB tunnel ─────────────────────────────", classes="section-header", markup=False)
+                with Horizontal(classes="field-row"):
+                    yield Label("Backend:", markup=False)
+                    yield Input(value="none", placeholder="none | cloudflared | ngrok", id="inp-tunnel-backend")
+
+                yield Label("── LLM solver ─────────────────────────────", classes="section-header", markup=False)
+                with Horizontal(classes="check-row"):
+                    yield Checkbox("Enable solver", id="chk-solve")
+                with Horizontal(classes="field-row"):
+                    yield Label("Provider:", markup=False)
+                    yield Input(value="claude", placeholder="claude | openai | ollama", id="inp-solve-provider")
+                with Horizontal(classes="field-row"):
+                    yield Label("Model:", markup=False)
+                    yield Input(placeholder="(provider default)", id="inp-solve-model")
+
+                yield Label("── Operator credentials (optional) ────────", classes="section-header", markup=False)
+                with Horizontal(classes="field-row"):
+                    yield Label("Email:", markup=False)
+                    yield Input(placeholder="(operator email)", id="inp-op-email")
+                with Horizontal(classes="field-row"):
+                    yield Label("Username:", markup=False)
+                    yield Input(placeholder="(operator username)", id="inp-op-username")
+                with Horizontal(classes="field-row"):
+                    yield Label("Password:", markup=False)
+                    yield Input(placeholder="(operator password)", id="inp-op-password", password=True)
+
             with Horizontal(id="btn-row"):
                 yield Button("Start", variant="primary", id="btn-start")
                 yield Button("Cancel", id="btn-cancel")
@@ -184,6 +218,13 @@ class WizardScreen(Screen[dict | None]):
                 max_pages = int(self.query_one("#inp-max-pages", Input).value or "80")
             except ValueError:
                 max_pages = 80
+            port_scan = (self.query_one("#inp-port-scan", Input).value or "none").strip().lower()
+            tunnel_backend = (self.query_one("#inp-tunnel-backend", Input).value or "none").strip().lower()
+            solve_provider = (self.query_one("#inp-solve-provider", Input).value or "claude").strip().lower()
+            solve_model = self.query_one("#inp-solve-model", Input).value.strip()
+            op_email = self.query_one("#inp-op-email", Input).value.strip()
+            op_username = self.query_one("#inp-op-username", Input).value.strip()
+            op_password = self.query_one("#inp-op-password", Input).value
             config = {
                 "mode": "manual",
                 "target": target,
@@ -196,6 +237,20 @@ class WizardScreen(Screen[dict | None]):
                 "passive": False,  # Manual = user toggles what to run
                 "allowed_hosts": allowed_raw.split() if allowed_raw else [],
                 "excluded_patterns": excluded_raw.split() if excluded_raw else [],
+                # Stage 0 — surface mapper
+                "auto_scope": self.query_one("#chk-auto-scope", Checkbox).value,
+                "analyze_block": self.query_one("#chk-analyze-block", Checkbox).value,
+                "port_scan": port_scan or "none",
+                # OOB tunnel
+                "tunnel_backend": tunnel_backend or "none",
+                # LLM solver
+                "solve": self.query_one("#chk-solve", Checkbox).value,
+                "solve_provider": solve_provider or "claude",
+                "solve_model": solve_model or None,
+                # Operator credentials (Wizard form, in lieu of hxxpsin.toml for now)
+                "auth_email": op_email or None,
+                "auth_username": op_username or None,
+                "auth_password": op_password or None,
             }
 
         self.dismiss(config)

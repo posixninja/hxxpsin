@@ -179,6 +179,31 @@ _TECHS: dict[str, dict] = {
             Signal("cookie_exists", "ASPXAUTH",            None,        3),
         ],
     },
+    "iis": {
+        "category": "infra", "display": "Microsoft IIS", "threshold": 2,
+        "signals": [
+            Signal("header_match",  "server",       r"Microsoft-IIS",       3),
+            Signal("header_match",  "x-powered-by", r"ASP\.NET",            2),
+            Signal("html_match",    "",             r"<title>IIS Windows",  3),
+        ],
+    },
+    "mssql": {
+        "category": "backend", "display": "Microsoft SQL Server", "threshold": 2,
+        "signals": [
+            Signal("html_match", "",
+                   r"Microsoft OLE DB Provider for SQL Server|"
+                   r"SQL Server Native Client|"
+                   r"\[SQL Server\]|"
+                   r"Msg \d+, Level \d+, State \d+", 4),
+            Signal("html_match", "", r"System\.Data\.SqlClient\.SqlException", 3),
+        ],
+    },
+    "windows_auth": {
+        "category": "auth", "display": "Windows Auth (NTLM/Kerberos)", "threshold": 2,
+        "signals": [
+            Signal("header_match", "www-authenticate", r"NTLM|Negotiate|Kerberos", 4),
+        ],
+    },
     "phoenix": {
         "category": "backend", "display": "Phoenix/Elixir", "threshold": 2,
         "signals": [

@@ -9,14 +9,14 @@ Reference methodology for timed challenges (3-hour CTF / interview format).
 Every web bug fits one of these. If your tool surfaces signals for all six,
 you've covered the full space:
 
-| Class | What it covers | hxxpsin module |
+| Class | What it covers | hxxpsin modules |
 |---|---|---|
-| **Identity confusion** | IDOR, BOLA, BFLA, mass assignment, role tampering | `classifier` → IDOR/BOLA, MASS_ASSIGN, BFLA |
-| **State transition abuse** | Race conditions, workflow bypass, coupon reuse | `classifier` → RACE |
-| **Parser differentials** | H2↓H1 desync, request smuggling, header normalization | `desync_probe` → protocol probe |
-| **Trust boundary violations** | SSRF, file upload, webhooks, URL fetchers | `classifier` → SSRF, UPLOAD |
-| **Data exposure via caching** | Cache poisoning, cookie leakage, unkeyed headers | `desync_probe` → cacheability, unkeyed_hdr, cookie_key |
-| **Injection into interpreter** | SQLi, XSS, template injection, command injection | `classifier` → INJECTION + nuclei templates |
+| **Identity confusion** | IDOR, BOLA, BFLA, mass assignment, role tampering | `classifier`, `idor_probe` (two-account), `data_extractor` (post-confirm pull) |
+| **State transition abuse** | Race conditions, workflow bypass, coupon reuse | `classifier` → RACE, `active_scanner`, `auth_bypass` |
+| **Parser differentials** | H2↓H1 desync, request smuggling, header normalization, CT confusion, CRLF | `desync_probe`, `ct_probe`, `crlf_probe` |
+| **Trust boundary violations** | SSRF, file upload, webhooks, URL fetchers | `classifier` → SSRF, `upload_probe`, `active_scanner` (SSRF), `payload_server` (OOB) |
+| **Data exposure via caching/sharing** | Cache poisoning, cookie leakage, unkeyed headers, source maps | `desync_probe`, `js_deep_analyzer`, `file_grabber` |
+| **Injection into interpreter** | SQLi, XSS, template injection, command injection, NoSQL, LDAP, XXE | `classifier` → INJECTION, `active_scanner`, `dom_xss_probe`, `nosql_probe`, `sql_dump` (post-confirm), `ldap_dump` (post-confirm) |
 
 The key insight: these map directly to exploit-dev primitives.
 "Identity confusion" = confused deputy. "Parser differentials" = protocol fuzzing.
@@ -80,8 +80,10 @@ http://127.0.0.1/
 - Old token after logout
 - Victim object ID with attacker token
 - Remove Authorization header
-- JWT: alg=none, kid/jku/x5u header abuse, decode for role/user_id
+- JWT: alg=none, kid/jku/x5u header abuse, decode for role/user_id (covered by `jwt_attack`)
 - Direct /admin access
+- Method/header override auth bypass — `X-Original-URL`, `X-Forwarded-For: 127.0.0.1`,
+  trailing-slash / case / extension tricks (covered by `auth_bypass` + `access_replay`)
 
 ### 6. Finding write-up format
 ```
@@ -185,3 +187,27 @@ client-side secret exposure, LocalStorage token theft, clickjacking, XS-Leaks, C
 /admin     /internal /swagger /openapi.json
 /graphql   /graphiql /api/v1  /api/v2
 ```
+
+## Module map (which module owns which step)
+
+| Step | Module(s) |
+|---|---|
+| Pre-scope: subdomain/ASN/vhost (opt-in) | `surface_mapper`, `dns_recon` |
+| Pre-scope + enrichment seed from Metasploit workspace (opt-in) | `msf_ingest` — pulls hosts/services into `scope.json`, folds creds/loot/notes/vulns into enrichment; optional push-back of confirmed findings as MSF vulns |
+| Stack fingerprint + path probes | `stackprint`, `playbooks` |
+| Browser crawl / HAR import | `crawler`, `collector`, `har_import`, `spa_router` |
+| Auto register + log in | `auto_auth`, `mailbox`, `captcha`, `tunnel`, `auth_config` |
+| JS bundle deep dive (routes, secrets, source maps, DOM-XSS) | `js_deep_analyzer`, `browser_verifier`, `dom_xss_probe` |
+| Classify findings by category and risk | `classifier` |
+| JWT attack analysis | `jwt_attack` |
+| Hidden parameter discovery | `param_miner` |
+| "Likely" verification + CORS + JS verify (+ local LLM) | `verifier`, `llm_verifier` |
+| Open redirect (49 bypass classes × 14 surfaces) | `open_redirect` |
+| Active injection (SQLi/CMDi/LDAPi/XXE/PT/SSTI) | `active_scanner`, `nosql_probe`, `auth_bypass` |
+| Desync / cache / CT confusion / CRLF / WebSocket | `desync_probe`, `ct_probe`, `crlf_probe`, `ws_probe` |
+| Upload bypass + replay of 401/403 with discovered tokens | `upload_probe`, `access_replay` |
+| Post-confirm data extraction | `data_extractor`, `sql_dump`, `ldap_dump`, `file_grabber` |
+| Response-body enrichment (users, hosts, secrets, images) | `enricher`, `secrets`, `image_analyzer` |
+| Agentic confirmation (Claude / OpenAI / Ollama) | `challenge_solver`, `claude_client`, `openai_client`, `ollama_agent` |
+| Report + briefing | `reporter`, `briefing_generator` |
+| Encoding helpers everywhere | `codec` (URL/Base64/Unicode/HTML/JS escape) |

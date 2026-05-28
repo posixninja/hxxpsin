@@ -21,12 +21,14 @@ Timed challenge flow:
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 # Guard against missing playwright — quick mode works without it
 try:
@@ -42,6 +44,12 @@ from access_replay import (
 from active_scanner import ActiveScanner, auto_fuzz_findings
 from auth_bypass import AuthBypassProbe
 from auto_auth import AutoAuth
+import auth_config
+import captcha as captcha_mod
+import mailbox as mailbox_mod
+import msf_ingest
+import payload_server as payload_server_mod
+import tunnel as tunnel_mod
 from browser_verifier import BrowserVerifier
 from dom_xss_probe import DOMXSSProbe
 from file_grabber import FileGrabber, FileGrabResult
@@ -58,16 +66,25 @@ from enricher import Enricher
 from intruder import Intruder, IntruderRequest, load_payloads
 from js_deep_analyzer import JSDeepAnalyzer, js_urls_from_profile, generate_test_cases
 from jwt_attack import JWTAnalyzer
+from challenge_solver import solve_findings
+from claude_client import ClaudeClient
 from llm_client import LLMClient
 from llm_verifier import LLMVerifier
+from ollama_agent import run_ollama_agent
+from openai_client import OpenAIClient
 from nosql_probe import NoSQLProbe
 from open_redirect import OpenRedirectProbe
 from param_miner import ParamMiner
+from ldap_dump import LDAPDumper
+from scm_probe import SCMProbe
+from smb_sink import SMBSink
 from sql_dump import SQLDumper
+from sql_probe import SQLProbe
 from upload_probe import UploadProbe
 from repeater import Repeater, ReplayRequest
 from reporter import Reporter
 from stackprint import Stackprint, StackProfile
+from surface_mapper import SurfaceMapperConfig, map_surface
 from verifier import Verifier, VerifyReport, verify_cors, verify_js_findings
 from ws_probe import WSProbe, WSProbeResult
 
@@ -86,10 +103,31 @@ def _err(msg: str) -> None:
         _progress_cb("err", msg)
 
 
+def _servus_configured(ctx) -> bool:
+    """True when the operator has wired up servus (token in env or [servus]
+    block in hxxpsin.toml). Used as a pre-flight for --solve since servus
+    holds the upstream provider key, not hxxpsin."""
+    if os.environ.get("SERVUS_AGENT_TOKEN"):
+        return True
+    cfg = getattr(ctx, "config", None) if ctx is not None else None
+    servus = getattr(cfg, "servus", None) if cfg is not None else None
+    return bool(getattr(servus, "agent_token", None))
+
+
 def _step(n: int, total: int, label: str) -> None:
     print(f"\n[{n}/{total}] {label}", file=sys.stderr)
     if _progress_cb:
         _progress_cb("step", n, total, label)
+
+
+def _emit(event: str, *args) -> None:
+    """Best-effort emit of a non-step progress event (tunnel_up, tunnel_hit,
+    surface_step, llm_decision). Silently no-ops if no callback is registered."""
+    if _progress_cb:
+        try:
+            _progress_cb(event, *args)
+        except Exception:
+            pass
 
 
 # CDN/WAF families that reliably block headless browsers (Playwright TLS
@@ -123,6 +161,232 @@ def _maybe_bail_on_cdn(args, profile: "StackProfile") -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Operator-config + OOB lifecycle
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ScanContext:
+    """Shared state built once at scan-start, stashed on `args._ctx`. Carries
+    operator config + lazily-started OOB infra (payload server + tunnel)."""
+    config: "auth_config.Config"
+    target_profile: "auth_config.TargetProfile"
+    mail_backend: Optional[object] = None
+    captcha_solver: Optional[object] = None
+    payload_server: Optional[object] = None
+    tunnel: Optional[object] = None
+    public_url: Optional[str] = None
+    smb_sink: Optional[object] = None
+    msf_client: Optional[object] = None        # msf_ingest.MSFClient or None
+    msf_workspace: str = ""                    # effective workspace for this scan
+    msf_result: Optional[object] = None        # msf_ingest.MSFIngestResult, mutated in place
+
+    def to_dict(self) -> dict:
+        return {
+            "config_sources": [str(p) for p in self.config.sources],
+            "matched_target": self.target_profile.matched_key,
+            "mail_backend": type(self.mail_backend).__name__ if self.mail_backend else None,
+            "captcha_solver": type(self.captcha_solver).__name__ if self.captcha_solver else None,
+            "tunnel_backend": (self.tunnel.backend_name if self.tunnel else None),
+            "public_url": self.public_url,
+            "smb_sink": (self.smb_sink.to_dict() if self.smb_sink else None),
+            "msf_backend": (self.msf_client.backend if self.msf_client else None),
+            "msf_workspace": self.msf_workspace or None,
+        }
+
+
+async def _build_scan_context(args) -> _ScanContext:
+    """Load operator config, resolve per-target overrides, and start the OOB
+    tunnel + payload server. Returns a populated _ScanContext that downstream
+    constructors read from. Failures degrade gracefully — probes check
+    payload_server/public_url and no-op when missing."""
+    try:
+        cfg = auth_config.load(getattr(args, "auth_config", None))
+    except auth_config.ConfigError as exc:
+        _err(f"⚠ operator config error: {exc} — continuing with defaults")
+        cfg = auth_config.Config()
+
+    # Wire the [servus] section into the singleton ServusLLMClient so every
+    # provider shim (ClaudeClient / OpenAIClient / LLMClient) picks up the
+    # configured base URL, bearer token, and initiator subject. Env-var
+    # overrides still win (see auth_config.load).
+    try:
+        import servus_client
+        servus_client.configure_from_profile(cfg.servus)
+    except Exception as e:
+        _err(f"⚠ servus client init failed: {e} — falling back to env vars")
+
+    tp = cfg.resolve_for(args.target)
+    if cfg.sources or tp.matched_key:
+        _err(f"[*] config: {auth_config.summary_for_target(cfg, args.target)}")
+
+    ctx = _ScanContext(config=cfg, target_profile=tp)
+
+    # Mail backend — operator's [mail.*] block referenced by target, else None
+    if tp.mail is not None:
+        try:
+            ctx.mail_backend = mailbox_mod.from_profile(tp.mail, target_url=args.target)
+        except Exception as exc:
+            _err(f"⚠ mail backend init failed: {exc}")
+
+    # Captcha solver — only when [captcha].mode != 'none'
+    snapshot = Path(args.out) / "manual-auth.json"
+    try:
+        ctx.captcha_solver = captcha_mod.from_profile(cfg.captcha, snapshot_path=snapshot)
+    except NotImplementedError as exc:
+        _err(f"⚠ {exc}")
+    except Exception as exc:
+        _err(f"⚠ captcha solver init failed: {exc}")
+
+    # Payload server + tunnel — start both, surface the public URL
+    if cfg.tunnel.backend != "none":
+        try:
+            ctx.payload_server = payload_server_mod.from_profile(cfg.payload_server)
+            await ctx.payload_server.start()
+            # Wire a per-hit callback so the TUI receives `tunnel_hit` events as
+            # incoming OOB callbacks arrive (SSRF, XXE, OAuth leaks).
+            try:
+                ctx.payload_server.on_hit = lambda hit: _emit("tunnel_hit", hit.to_dict())
+            except Exception:
+                pass
+            ctx.tunnel = tunnel_mod.from_profile(cfg.tunnel, local_url=ctx.payload_server.local_url)
+            ctx.public_url = await ctx.tunnel.start()
+            if ctx.public_url:
+                _err(f"[*] OOB tunnel up: {cfg.tunnel.backend} → {ctx.public_url}")
+                _emit("tunnel_up", cfg.tunnel.backend, ctx.public_url)
+            else:
+                _err(f"⚠ tunnel ({cfg.tunnel.backend}) started but no public URL surfaced")
+        except tunnel_mod.TunnelError as exc:
+            _err(f"⚠ tunnel skipped: {exc}")
+            ctx.tunnel = None
+            ctx.public_url = None
+        except Exception as exc:
+            _err(f"⚠ tunnel init failed: {type(exc).__name__}: {exc}")
+
+    # SMB sink — opt-in via --allow-windows-destructive + --active-scan, since
+    # binding an SMB listener is loud and only useful for the MSSQL UNC-coerce
+    # path. Failure to start (port conflict, missing impacket) is non-fatal —
+    # SQLProbe falls back to HTTP/DNS canary callbacks.
+    if (getattr(args, "active_scan", False)
+            and getattr(args, "allow_windows_destructive", False)):
+        smb_port = getattr(args, "smb_port", 4445)
+        try:
+            sink = SMBSink(listen_port=smb_port)
+            await sink.start()
+            ctx.smb_sink = sink
+            _err(f"[*] SMB sink up: 0.0.0.0:{smb_port} (share={sink.share_name}) — "
+                 "NTLM hashes captured to sql_probe.json")
+        except Exception as exc:
+            _err(f"⚠ SMB sink not started: {type(exc).__name__}: {exc}")
+            _err("    (port may need root or another process is bound; "
+                 "xp_dirtree coercion will fall back to canary OOB only)")
+            ctx.smb_sink = None
+
+    # MSF Framework workspace — opt-in via [msf].enabled or --msf flag.
+    # Tries msfrpcd first; falls back to direct Postgres. Failure here
+    # never aborts the scan — the integration is supplementary.
+    msf_profile = cfg.msf
+    cli_force_on = bool(getattr(args, "msf", False))
+    cli_force_off = bool(getattr(args, "no_msf", False))
+    msf_active = ((msf_profile.enabled or cli_force_on) and not cli_force_off)
+    if msf_active:
+        # CLI overrides
+        msf_profile.enabled = True  # in-memory mutation, doesn't persist
+        if getattr(args, "msf_workspace", None):
+            msf_profile.workspace = args.msf_workspace
+        if getattr(args, "msf_push", False):
+            msf_profile.push_findings = True
+        ctx.msf_workspace = msf_profile.workspace or "default"
+        try:
+            ctx.msf_client = await msf_ingest.make_msf_client(msf_profile)
+        except msf_ingest.MSFIngestError as exc:
+            _err(f"⚠ msf skipped: {exc}")
+            ctx.msf_client = None
+        except Exception as exc:
+            _err(f"⚠ msf init failed: {type(exc).__name__}: {exc}")
+            ctx.msf_client = None
+        if ctx.msf_client is not None:
+            _err(f"[*] MSF integration up: backend={ctx.msf_client.backend} "
+                 f"workspace={ctx.msf_workspace}"
+                 + (" push=on" if msf_profile.push_findings else ""))
+            _emit("msf_ingest_step", "connected", 0)
+
+    return ctx
+
+
+def _auto_auth_kwargs_from_ctx(args, fresh_account: bool = False) -> dict:
+    """Pull AutoAuth-relevant fields off the scan context. CLI flags still win
+    when set — config supplies fallbacks for absent values.
+
+    `fresh_account=True` is used by the second-account IDOR provisioning path:
+    we still want mail backend + captcha solver wired (to clear registration
+    barriers), but we deliberately skip the named email/password/username so
+    AutoAuth generates a distinct identity instead of re-logging the operator's
+    primary account."""
+    ctx: Optional[_ScanContext] = getattr(args, "_ctx", None)
+    if ctx is None:
+        return {}
+    tp = ctx.target_profile
+    kw: dict = {}
+    if ctx.mail_backend is not None:
+        kw["mail_backend"] = ctx.mail_backend
+    if ctx.captcha_solver is not None:
+        kw["captcha_solver"] = ctx.captcha_solver
+    if tp.totp_secret and not fresh_account:
+        kw["totp_secret"] = tp.totp_secret
+    if not fresh_account:
+        if tp.email and not getattr(args, "auth_email", None):
+            kw["email"] = tp.email
+        if tp.password and not getattr(args, "auth_password", None):
+            kw["password"] = tp.password
+        if tp.username and not getattr(args, "auth_username", None):
+            kw["username"] = tp.username
+    kw["manual_snapshot_path"] = Path(args.out) / "manual-auth.json"
+    return kw
+
+
+async def _teardown_scan_context(ctx: Optional[_ScanContext], out: Path) -> None:
+    """Persist tunnel hits + close everything."""
+    if ctx is None:
+        return
+    if ctx.payload_server is not None:
+        try:
+            hits = [h.to_dict() for h in ctx.payload_server.hits]
+            (out / "tunnel_hits.json").write_text(json.dumps({
+                "context": ctx.to_dict(),
+                "hits": hits,
+            }, indent=2))
+            if hits:
+                _err(f"OOB tunnel: {len(hits)} hit(s) captured → {out}/tunnel_hits.json")
+        except Exception as exc:
+            _err(f"⚠ tunnel_hits.json write failed: {exc}")
+    if ctx.tunnel is not None:
+        try:
+            await ctx.tunnel.stop()
+        except Exception:
+            pass
+    if ctx.payload_server is not None:
+        try:
+            await ctx.payload_server.stop()
+        except Exception:
+            pass
+    if ctx.smb_sink is not None:
+        try:
+            await ctx.smb_sink.stop()
+        except Exception:
+            pass
+    if ctx.mail_backend is not None:
+        try:
+            await ctx.mail_backend.aclose()
+        except Exception:
+            pass
+    if ctx.msf_client is not None:
+        try:
+            await ctx.msf_client.disconnect()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # scan command
 # ---------------------------------------------------------------------------
 
@@ -137,8 +401,122 @@ async def cmd_scan(args) -> None:
         await cmd_quick(args)
         return
 
+    # Operator config + OOB lifecycle — stashed on args for downstream
+    # functions (AutoAuth, ActiveScanner, OpenRedirectProbe, UploadProbe)
+    args._ctx = await _build_scan_context(args)
+    try:
+        await _cmd_scan_body(args, start, out)
+    finally:
+        await _teardown_scan_context(args._ctx, out)
+
+
+async def _run_surface_mapper(args, out: Path) -> None:
+    """Stage 0: attack-surface expansion. No-op unless the operator opted in
+    via --auto-scope, --port-scan, --analyze-block, or has MSF enabled (MSF
+    seeds the same scope from an existing workspace)."""
+    auto_scope = getattr(args, "auto_scope", False)
+    port_scan = getattr(args, "port_scan", "none")
+    analyze_block = getattr(args, "analyze_block", False)
+    ctx = getattr(args, "_ctx", None)
+    msf_on = bool(ctx and ctx.msf_client is not None)
+    if not (auto_scope or port_scan != "none" or analyze_block or msf_on):
+        return
+
+    cfg = SurfaceMapperConfig(
+        auto_scope=auto_scope,
+        port_scan=port_scan,
+        analyze_block=analyze_block,
+        analyze_block_max=getattr(args, "analyze_block_max", 20),
+        scope_suffix=getattr(args, "scope_suffix", None),
+    )
+
+    def _log(event, fields):
+        _err(f"[recon] {event} {fields}")
+        # Surface mapper structured events include counts the TUI can show live.
+        if isinstance(fields, dict):
+            count = fields.get("count")
+            if count is None:
+                count = fields.get("n") or fields.get("hosts") or fields.get("vhosts")
+            try:
+                _emit("surface_step", str(event), int(count) if count is not None else 0)
+            except Exception:
+                pass
+
+    _err("[+] Stage 0: surface mapping "
+         f"(auto_scope={auto_scope} port_scan={port_scan} "
+         f"analyze_block={analyze_block})")
+    _emit("surface_step", "start", 0)
+    scope = await map_surface(args.target, cfg, out_dir=out, log=_log)
+    args._scope = scope
+
+    # MSF host/service seed (in-place dedupe merge into scope.hosts).
+    await _run_msf_recon_seed(args, scope, out)
+
+    n_hosts = len(scope.hosts)
+    n_ports = sum(len(h.open_ports) for h in scope.hosts)
+    n_vh = sum(1 for v in scope.vhost_hits if v.distinct_from_baseline)
+    n_asn = len(scope.asn)
+    _err(f"[+] Surface map: {n_hosts} hosts, {n_ports} open ports, "
+         f"{n_asn} ASN(s), {n_vh} distinct vhost responses "
+         f"→ {out}/recon/scope.json")
+    _emit("surface_step", "done", n_hosts)
+
+
+async def _run_msf_recon_seed(args, scope, out: Path) -> None:
+    """Pull MSF hosts/services into the Scope and persist updated scope.json.
+
+    Runs from _run_surface_mapper after map_surface(); also called from
+    _finish_pipeline when surface_mapper was skipped so MSF data can still
+    augment enrichment without --auto-scope being set."""
+    ctx = getattr(args, "_ctx", None)
+    if ctx is None or ctx.msf_client is None:
+        return
+
+    def _log(event: str, fields: dict) -> None:
+        _err(f"[msf] {event} {fields}")
+        try:
+            count = 0
+            if isinstance(fields, dict):
+                count = int(fields.get("hosts", 0) or fields.get("count", 0) or 0)
+            _emit("msf_ingest_step", event, count)
+        except Exception:
+            pass
+
+    workspace = ctx.msf_workspace or "default"
+    result = await msf_ingest.augment_scope_from_msf(
+        scope, ctx.msf_client, workspace, log_cb=_log,
+    )
+    if getattr(ctx.config.msf, "pull_sessions", True):
+        await msf_ingest.pull_sessions_into_result(
+            ctx.msf_client, args.target, workspace, result, log_cb=_log,
+        )
+        if result.sessions_on_target:
+            host = urlparse(args.target).hostname or args.target
+            sids = ", ".join(str(s.get("id")) for s in result.sessions_on_target)
+            _err(f"⚠ MSF has live meterpreter on {host} "
+                 f"(session id(s): {sids}) — you may already own this host")
+    ctx.msf_result = result
+    _err(f"[+] MSF: pulled {result.pulled_hosts} hosts, "
+         f"{result.pulled_services} services, "
+         f"{result.pulled_sessions} session(s) from workspace={workspace} "
+         f"(backend={result.backend}, overlap={len(result.overlapped_hosts)})")
+
+    # Persist the augmented scope so the TUI + downstream loaders see MSF data.
+    recon_dir = out / "recon"
+    recon_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        (recon_dir / "scope.json").write_text(json.dumps(scope.to_dict(), indent=2))
+    except Exception as exc:
+        _err(f"⚠ scope.json rewrite failed: {exc}")
+
+
+async def _cmd_scan_body(args, start, out) -> None:
+
     # total_steps: 2 stackprint+crawl + 11 pipeline steps = 13
     total_steps = 13
+
+    # ── 0. surface mapper (opt-in via --auto-scope / --port-scan / --analyze-block)
+    await _run_surface_mapper(args, out)
 
     # ── 1. stackprint ───────────────────────────────────────────────────
     _step(1, total_steps, f"Fingerprinting stack: {args.target}")
@@ -150,6 +528,31 @@ async def cmd_scan(args) -> None:
 
     if _maybe_bail_on_cdn(args, profile):
         return
+
+    # ── 1b. SCM / config exposure probe (Stage 0) ───────────────────────
+    # Walk a high-value path catalog (.git/HEAD, .env*, wp-config.php.bak,
+    # composer.lock, .DS_Store, …) and confirm exposure via shape-aware
+    # body matching. Any .env-shaped bodies are scanned through the
+    # unified [[secrets]] catalog so leaked AWS/GitHub/Stripe keys surface
+    # alongside the file finding. Runs pre-crawl, so we use whatever CLI-
+    # supplied auth headers exist; in-crawl harvested tokens aren't
+    # available yet at this point in the pipeline.
+    scm_probe_result = None
+    if not getattr(args, "no_scm_probe", False):
+        scm_probe_result = await SCMProbe(
+            out_dir=str(out), timeout=args.timeout,
+            auth_headers=_load_auth_headers(args),
+        ).run(args.target,
+              extra_bases=list(profile.interesting_paths)[:8])
+        if scm_probe_result.findings:
+            crit = len(scm_probe_result.critical)
+            _err(f"SCM probe: {len(scm_probe_result.findings)} exposure(s) "
+                 f"({crit} critical)")
+            for f in scm_probe_result.critical[:5]:
+                _err(f"  ✗ [{f.severity}] {f.kind}: {f.url}")
+        (out / "scm_probe.json").write_text(
+            json.dumps(scm_probe_result.to_dict(), indent=2)
+        )
 
     # ── 2. crawl OR HAR import ──────────────────────────────────────────
     # Live progress: pipe each new captured request through _progress_cb so the
@@ -179,7 +582,8 @@ async def cmd_scan(args) -> None:
         (out / "har_import.json").write_text(json.dumps(har_result.to_dict(), indent=2))
 
     await _finish_pipeline(args, profile, col, out, start, total_steps, step_offset=2,
-                           har_result=har_result, pre_auth_session=auto_auth_session)
+                           har_result=har_result, pre_auth_session=auto_auth_session,
+                           scm_probe_result=scm_probe_result)
 
 
 async def cmd_quick(args) -> None:
@@ -190,6 +594,9 @@ async def cmd_quick(args) -> None:
     out.mkdir(parents=True, exist_ok=True)
     # total_steps: 1 stackprint + 11 pipeline steps = 12
     total_steps = 12
+
+    # ── 0. surface mapper (opt-in via --auto-scope / --port-scan / --analyze-block)
+    await _run_surface_mapper(args, out)
 
     # ── 1. stackprint ───────────────────────────────────────────────────
     _step(1, total_steps, f"Fingerprinting stack: {args.target}")
@@ -424,6 +831,7 @@ async def _run_two_phase_crawl(args, profile: StackProfile, col: Collector,
             email=getattr(args, "auth_email", None),
             password=getattr(args, "auth_password", None),
             username=getattr(args, "auth_username", None),
+            **_auto_auth_kwargs_from_ctx(args),
         ).run(
             classifier_result=mid_result,
             js_routes=js_routes,
@@ -453,6 +861,7 @@ async def _run_two_phase_crawl(args, profile: StackProfile, col: Collector,
 
     label = "authenticated" if auto_auth_session.has_auth else "anonymous (AutoAuth failed)"
     _err(f"[*] Phase B — {label} deep crawl (Playwright)")
+    sys.stderr.flush()
     seed_paths = _seed_paths_for_authed_crawl(mid_result, args.target)
     cfg_b = CrawlConfig(
         start_url=args.target,
@@ -470,12 +879,31 @@ async def _run_two_phase_crawl(args, profile: StackProfile, col: Collector,
     for path in profile.interesting_paths[:30]:
         if crawler_b._is_spa_route_candidate(path):
             await crawler_b._enqueue(urljoin(args.target, path), 0)
+    # Hard wall-clock cap so a stuck Playwright / hung Chromium subprocess
+    # can't burn 20+ minutes silently. The previous failure mode after a
+    # mid-flight network change was a Playwright deadlock — no exception,
+    # no traceback, just a hung process. asyncio.wait_for() turns that into
+    # a recoverable TimeoutError instead of a silent freeze.
+    phase_b_timeout = max(60, args.phase_b_timeout)
+    # Flush stderr so the last status line before any future hang/SIGKILL
+    # is visible — protects against tee/buffering swallowing it.
+    sys.stderr.flush()
     try:
-        await crawler_b.run()
+        await asyncio.wait_for(crawler_b.run(), timeout=phase_b_timeout)
+    except asyncio.TimeoutError:
+        _err(f"  ✗ Phase B exceeded {phase_b_timeout}s wall-clock cap — "
+             f"Playwright is likely stuck (orphaned Chromium, network "
+             f"change mid-flight, or a stalled navigation). Proceeding "
+             f"with whatever Phase B captured before the timeout.")
+        _err(f"[crawl] mode=two_phase phase_a_pages={phase_a_pages} "
+             f"phase_b_pages={len(crawler_b._visited)} auto_auth=success timeout=true")
+        sys.stderr.flush()
+        return auto_auth_session
     except Exception as exc:
         _err(f"  ✗ Phase B crashed: {type(exc).__name__}: {exc} — "
              f"proceeding with Phase A data + AutoAuth headers")
         _err(f"[crawl] mode=two_phase phase_a_pages={phase_a_pages} phase_b_pages=0 auto_auth=success")
+        sys.stderr.flush()
         return auto_auth_session
 
     phase_b_pages = len(crawler_b._visited)
@@ -616,7 +1044,12 @@ async def _finish_pipeline(
     out: Path, start: float, total_steps: int, step_offset: int,
     har_result=None,                  # Optional[HARImportResult]
     pre_auth_session=None,            # Optional[AuthSession] from two-phase crawl
+    scm_probe_result=None,            # Optional[SCMProbeResult] from pre-crawl probe
 ) -> None:
+    # `os` is referenced below the function's later `import os` statements,
+    # which would otherwise make Python treat the name as local from byte 0.
+    # Importing it at the top avoids UnboundLocalError on early references.
+    import os
     offset = step_offset
 
     # Write collector.json now if not already written (quick mode skips the crawl step)
@@ -773,6 +1206,7 @@ async def _finish_pipeline(
                 email=getattr(args, "auth_email", None),
                 password=getattr(args, "auth_password", None),
                 username=getattr(args, "auth_username", None),
+                **_auto_auth_kwargs_from_ctx(args),
             ).run(
                 classifier_result=result,
                 js_routes=js_routes,
@@ -865,11 +1299,16 @@ async def _finish_pipeline(
     redirect_result = None
     if passive:
         _err("Open redirect: skipped (passive mode)")
+    elif os.environ.get("HXXPSIN_SKIP_REDIRECT"):
+        _err("Open redirect: skipped (HXXPSIN_SKIP_REDIRECT set)")
     elif getattr(args, "har", None) or not getattr(args, "_quick_mode", False):
+        _ctx = getattr(args, "_ctx", None)
         redirect_result = await OpenRedirectProbe(
             auth_headers=auth_hdrs,
             timeout=args.timeout,
             browser_verifier=browser_verifier,
+            payload_server=(_ctx.payload_server if _ctx else None),
+            public_url=(_ctx.public_url if _ctx else None),
         ).run(result.request_findings)
         _err(f"Open redirect: {redirect_result.endpoints_tested} endpoints tested, "
              f"{len(redirect_result.confirmed)} confirmed")
@@ -879,17 +1318,21 @@ async def _finish_pipeline(
     # ── active injection scan (opt-in) ────────────────────────────────────
     active_result = None
     nosql_result = None
+    sql_probe_result = None
     auth_bypass_result = None
     idor_result = None
     account_a: Optional[Account] = None
     account_b: Optional[Account] = None
     if getattr(args, "active_scan", False):
         _step(offset + 7, total_steps, "Active injection scan (--active-scan)")
+        _ctx = getattr(args, "_ctx", None)
         active_result = await ActiveScanner(
             auth_headers=auth_hdrs,
             timeout=args.timeout,
             canary=canary,
             browser_verifier=browser_verifier,
+            payload_server=(_ctx.payload_server if _ctx else None),
+            public_url=(_ctx.public_url if _ctx else None),
         ).run(
             verify_report.results,
             param_result.interesting if param_result else None,
@@ -905,6 +1348,25 @@ async def _finish_pipeline(
         ).run(result.request_findings)
         _err(f"NoSQL: {nosql_result.endpoints_tested} endpoints tested, "
              f"{len(nosql_result.confirmed)} confirmed")
+
+        # MSSQL dialect probe + NTLM coercion via SMB sink
+        _err("[+] MSSQL probing (--active-scan)")
+        _ctx = getattr(args, "_ctx", None)
+        sql_probe_result = await SQLProbe(
+            auth_headers=auth_hdrs,
+            timeout=args.timeout,
+            canary=canary,
+            payload_server=(_ctx.payload_server if _ctx else None),
+            smb_sink=(_ctx.smb_sink if _ctx else None),
+            public_url=(_ctx.public_url if _ctx else None),
+            stack_profile=profile,
+            allow_destructive=getattr(args, "allow_windows_destructive", False),
+        ).run(result.request_findings, active_result=active_result)
+        _err(f"SQL probe: {sql_probe_result.endpoints_tested} endpoints tested, "
+             f"{len(sql_probe_result.confirmed)} confirmed, "
+             f"{sql_probe_result.ntlm_hashes_captured} NTLM hash(es) captured")
+        for f in sql_probe_result.confirmed[:5]:
+            _err(f"  ✓ {f.attack_type} {f.endpoint[:60]} — {f.evidence[:80]}")
 
         _err("[+] Auth-bypass fuzzing (--active-scan)")
         auth_bypass_result = await AuthBypassProbe(
@@ -940,6 +1402,7 @@ async def _finish_pipeline(
                 second_session = await AutoAuth(
                     args.target, timeout=args.timeout,
                     email_domain=getattr(args, "auth_email_domain", None),
+                    **_auto_auth_kwargs_from_ctx(args, fresh_account=True),
                 ).run(classifier_result=result, js_routes=js_routes2)
                 account_b = IDORProbe.account_from_auto_auth(second_session, "B")
                 if account_b:
@@ -1160,6 +1623,22 @@ async def _finish_pipeline(
         file_grabber_result=grabber_result,
         auto_auth_session=auto_auth_session,
     )
+    # MSF creds/loot/notes/vulns → enrichment (in place; mutates
+    # ctx.msf_result so the Reporter sees one combined object).
+    _ctx_msf = getattr(args, "_ctx", None)
+    if _ctx_msf is not None and _ctx_msf.msf_client is not None:
+        try:
+            _ctx_msf.msf_result = await msf_ingest.merge_msf_into_enrichment(
+                enrichment_result, _ctx_msf.msf_client,
+                _ctx_msf.msf_workspace or "default",
+                accum=_ctx_msf.msf_result,
+                log_cb=lambda ev, fields: _err(f"[msf] {ev} {fields}"),
+            )
+            r = _ctx_msf.msf_result
+            _err(f"[+] MSF merge: creds={r.pulled_creds} loot={r.pulled_loot} "
+                 f"notes={r.pulled_notes} vulns={r.pulled_vulns}")
+        except Exception as exc:
+            _err(f"⚠ msf merge failed: {type(exc).__name__}: {exc}")
     s = enrichment_result.summary()
     by_type = ", ".join(f"{k}:{v}" for k, v in sorted(s["users_by_type"].items())) or "—"
     _err(f"Enrichment: {s['users']} identities ({by_type}), "
@@ -1210,8 +1689,11 @@ async def _finish_pipeline(
     # Content-Type bypass, traversal, SVG-XSS, polyglot, oversize).
     upload_probe_result = None
     if not getattr(args, "no_upload_probe", False):
+        _ctx = getattr(args, "_ctx", None)
         upload_probe_result = await UploadProbe(
             out_dir=str(out), timeout=args.timeout, auth_headers=auth_hdrs,
+            payload_server=(_ctx.payload_server if _ctx else None),
+            public_url=(_ctx.public_url if _ctx else None),
         ).run(result)
         if upload_probe_result.endpoints_tested:
             _err(f"Upload probe: {upload_probe_result.endpoints_tested} endpoints, "
@@ -1247,6 +1729,34 @@ async def _finish_pipeline(
             json.dumps(sql_dump_result.to_dict(), indent=2)
         )
 
+    # ── LDAP/AD dump (when ActiveScanner / classifier surfaces LDAP injection) ──
+    # Vendor-fingerprint the directory (OpenLDAP / Active Directory / ApacheDS /
+    # OpenDJ), confirm boolean-blind injection at the param level, then extract
+    # high-value attributes (sAMAccountName, memberOf, userAccountControl, SPN,
+    # adminCount, LAPS, GMSA). AD UAC flags get parsed into named tags so
+    # KERBEROASTABLE / ASREPROASTABLE / DOMAIN_ADMIN / LAPS_READABLE surface
+    # directly in the report. Cross-links into enrichment/users/<id>/ldap/.
+    ldap_dump_result = None
+    if active_result and not getattr(args, "no_ldap_dump", False):
+        ldap_dump_result = await LDAPDumper(
+            out_dir=str(out), timeout=args.timeout, auth_headers=auth_hdrs,
+        ).run(active_result,
+              classifier_findings=result.request_findings,
+              enrichment_result=enrichment_result)
+        if ldap_dump_result.fingerprints:
+            fp_str = ", ".join(f"{f.vendor}({f.confidence:.2f})"
+                                for f in ldap_dump_result.fingerprints)
+            _err(f"LDAP dump: vendor={fp_str}, "
+                 f"{len(ldap_dump_result.confirmed_injections)} confirmed injection(s), "
+                 f"{len(ldap_dump_result.accounts)} account(s) dumped, "
+                 f"{len(ldap_dump_result.high_value)} high-value tag(s)")
+        elif ldap_dump_result.notes:
+            for n in ldap_dump_result.notes:
+                _err(f"  LDAP dump: {n}")
+        (out / "ldap_dump.json").write_text(
+            json.dumps(ldap_dump_result.to_dict(), indent=2)
+        )
+
     # ── LLM verification (opt-in) ────────────────────────────────────────
     # Local Ollama LLM verifies "likely" heuristic findings — adds llm_verdict
     # to each finding without overriding the heuristic. Cache is on disk so
@@ -1279,8 +1789,220 @@ async def _finish_pipeline(
                     json.dumps(llm_verification_result.to_dict(), indent=2)
                 )
 
+    # ── Agentic solver (opt-in) ─────────────────────────────────────────
+    # Hand the top classifier findings to an LLM agent with http_request /
+    # browser_eval / read_finding / run_nuclei tools. Each finding gets a
+    # bounded turn budget; the agent returns a verdict + evidence per
+    # finding. Provider is selectable: 'claude' (Anthropic API, native
+    # tool-use) or 'ollama' (local model, ReAct JSON prompting).
+    solver_result = None
+    if getattr(args, "solve", False):
+        provider = (getattr(args, "solve_provider", "claude") or "claude").lower()
+        storage_state = args.auth or getattr(args, "auth_a", None)
+        # Pick model default based on provider when the user didn't specify
+        if not args.solve_model:
+            args.solve_model = {
+                "ollama": "qwen2.5:7b",
+                "openai": "gpt-5",
+                "claude": "claude-opus-4-7",
+            }.get(provider, "claude-opus-4-7")
+
+        # Forward solver events to the TUI so the LLM tab can show decisions live.
+        def _solver_event(kind, *evargs):
+            try:
+                if kind == "solve_start" and len(evargs) >= 3:
+                    idx, method, url = evargs[0], evargs[1], evargs[2]
+                    _emit("llm_decision", {
+                        "stage": "start", "finding_index": idx,
+                        "method": method, "url": url,
+                        "model": args.solve_model, "provider": provider,
+                    })
+                elif kind == "solve_done" and len(evargs) >= 3:
+                    idx, verdict, reason = evargs[0], evargs[1], evargs[2]
+                    _emit("llm_decision", {
+                        "stage": "verdict", "finding_index": idx,
+                        "verdict": verdict, "reason": reason,
+                        "model": args.solve_model, "provider": provider,
+                    })
+            except Exception:
+                pass
+
+        if provider == "ollama":
+            _err(f"[+] Solver (ollama): model={args.solve_model} "
+                 f"top_n={args.solve_top} max_turns={args.solve_max_turns} "
+                 f"budget={args.solve_budget}")
+            async with LLMClient(
+                host=args.llm_host, model=args.solve_model,
+                cache_dir=str(out / "ollama_solver_cache"),
+                budget=args.solve_budget, timeout=120.0,
+                verbose=False,
+            ) as llm:
+                if not await llm.is_alive():
+                    _err(f"  ✗ Ollama not reachable at {args.llm_host} — skipping")
+                else:
+                    solver_result = await solve_findings(
+                        llm_generate=llm.generate,
+                        model_name=args.solve_model,
+                        budget_stats=llm.stats,
+                        classifier_result=result,
+                        target=args.target,
+                        out_dir=out,
+                        auth_headers=auth_hdrs,
+                        storage_state_path=storage_state,
+                        top_n=args.solve_top,
+                        verbose=args.solve_verbose,
+                        public_url=(_ctx.public_url if _ctx else None),
+                        on_event=_solver_event,
+                    )
+                    s = llm.stats
+                    _err(f"  Ollama stats: {s.calls_made} calls, "
+                         f"{s.cache_hits} cache hits, {s.errors} errors, "
+                         f"avg {s.total_elapsed_ms / max(s.calls_made, 1):.0f}ms")
+                    _err(f"  Verdicts: {solver_result.confirmed} confirmed, "
+                         f"{solver_result.refuted} refuted, "
+                         f"{solver_result.inconclusive} inconclusive"
+                         + (f", ⚠ {solver_result.refusals} refusal(s)"
+                            if solver_result.refusals else ""))
+                    (out / "solver.json").write_text(
+                        json.dumps(solver_result.to_dict(), indent=2)
+                    )
+        elif provider == "openai":
+            if not _servus_configured(_ctx):
+                _err(
+                    "[!] --solve requires servus — set SERVUS_AGENT_TOKEN "
+                    "(or [servus].agent_token_env in hxxpsin.toml); skipping"
+                )
+            else:
+                _err(f"[+] Solver (openai via servus): model={args.solve_model} "
+                     f"top_n={args.solve_top} max_turns={args.solve_max_turns} "
+                     f"budget={args.solve_budget}")
+                async with OpenAIClient(
+                    model=args.solve_model,
+                    cache_dir=str(out / "openai_cache"),
+                    budget=args.solve_budget,
+                    timeout=120.0,
+                    max_tokens=2048,
+                    verbose=False,
+                ) as oa:
+                    if not await oa.is_alive():
+                        _err("  ✗ servus unreachable — skipping")
+                    else:
+                        solver_result = await solve_findings(
+                            llm_generate=oa.generate,
+                            model_name=oa.model,
+                            budget_stats=oa.stats,
+                            classifier_result=result,
+                            target=args.target,
+                            out_dir=out,
+                            auth_headers=auth_hdrs,
+                            storage_state_path=storage_state,
+                            top_n=args.solve_top,
+                            verbose=args.solve_verbose,
+                            public_url=(_ctx.public_url if _ctx else None),
+                            on_event=_solver_event,
+                        )
+                        s = oa.stats
+                        _err(f"  OpenAI stats: {s.calls_made} calls, "
+                             f"{s.cache_hits} cache hits, {s.errors} errors, "
+                             f"{s.total_input_tokens}in / {s.total_output_tokens}out tokens")
+                        _err(f"  Verdicts: {solver_result.confirmed} confirmed, "
+                             f"{solver_result.refuted} refuted, "
+                             f"{solver_result.inconclusive} inconclusive"
+                             + (f", ⚠ {solver_result.refusals} refusal(s)"
+                                if solver_result.refusals else ""))
+                        (out / "solver.json").write_text(
+                            json.dumps(solver_result.to_dict(), indent=2)
+                        )
+        else:
+            if not _servus_configured(_ctx):
+                _err(
+                    "[!] --solve requires servus — set SERVUS_AGENT_TOKEN "
+                    "(or [servus].agent_token_env in hxxpsin.toml); skipping"
+                )
+            else:
+                _err(f"[+] Solver (claude via servus): model={args.solve_model} "
+                     f"top_n={args.solve_top} max_turns={args.solve_max_turns} "
+                     f"budget={args.solve_budget}")
+                async with ClaudeClient(
+                    model=args.solve_model,
+                    cache_dir=str(out / "claude_cache"),
+                    budget=args.solve_budget,
+                    timeout=120.0,
+                    max_tokens=2048,
+                    verbose=False,
+                ) as claude:
+                    if not await claude.is_alive():
+                        _err("  ✗ servus unreachable — skipping")
+                    else:
+                        solver_result = await solve_findings(
+                            llm_generate=claude.generate,
+                            model_name=claude.model,
+                            budget_stats=claude.stats,
+                            classifier_result=result,
+                            target=args.target,
+                            out_dir=out,
+                            auth_headers=auth_hdrs,
+                            storage_state_path=storage_state,
+                            top_n=args.solve_top,
+                            verbose=args.solve_verbose,
+                            public_url=(_ctx.public_url if _ctx else None),
+                            on_event=_solver_event,
+                        )
+                        s = claude.stats
+                        _err(f"  Claude stats: {s.calls_made} calls, "
+                             f"{s.cache_hits} cache hits, {s.errors} errors, "
+                             f"{s.total_input_tokens}in / {s.total_output_tokens}out tokens")
+                        _err(f"  Verdicts: {solver_result.confirmed} confirmed, "
+                             f"{solver_result.refuted} refuted, "
+                             f"{solver_result.inconclusive} inconclusive"
+                             + (f", ⚠ {solver_result.refusals} refusal(s)"
+                                if solver_result.refusals else ""))
+                        (out / "solver.json").write_text(
+                            json.dumps(solver_result.to_dict(), indent=2)
+                        )
+
+    # ── MSF push-back (opt-in via [msf].push_findings or --msf-push) ────
+    _ctx_push = getattr(args, "_ctx", None)
+    if (_ctx_push is not None and _ctx_push.msf_client is not None
+            and _ctx_push.config.msf.push_findings):
+        try:
+            _ctx_push.msf_result = await msf_ingest.push_findings(
+                _ctx_push.msf_client, args.target,
+                result.request_findings,
+                out_dir=out,
+                min_score=_ctx_push.config.msf.push_min_score,
+                accum=_ctx_push.msf_result,
+                log_cb=lambda ev, fields: _err(f"[msf] {ev} {fields}"),
+            )
+            n_pushed = len(_ctx_push.msf_result.pushed_vulns)
+            if n_pushed:
+                _err(f"[+] MSF push: {n_pushed} finding(s) recorded as vulns "
+                     f"in workspace={_ctx_push.msf_workspace}")
+        except Exception as exc:
+            _err(f"⚠ msf push failed: {type(exc).__name__}: {exc}")
+
+    # ── MSF module suggestions (PR1/Bundle B — non-network, pure mapping) ──
+    if (_ctx_push is not None and _ctx_push.msf_client is not None
+            and getattr(_ctx_push.config.msf, "suggest_modules", True)):
+        if _ctx_push.msf_result is None:
+            _ctx_push.msf_result = msf_ingest.MSFIngestResult(
+                backend=_ctx_push.msf_client.backend,
+                workspace=_ctx_push.msf_workspace or "default",
+            )
+        for f in (result.request_findings or []):
+            url = getattr(f, "url", "") or ""
+            if not url:
+                continue
+            hints = await msf_ingest.suggest_modules(_ctx_push.msf_client, f)
+            if hints:
+                _ctx_push.msf_result.suggested_modules[url] = hints
+
     # ── report ────────────────────────────────────────────────────────────
     _step(offset + 11, total_steps, "Writing report")
+    _ctx = getattr(args, "_ctx", None)
+    _tunnel_hits = list(_ctx.payload_server.hits) if (_ctx and _ctx.payload_server) else []
+    _tunnel_info = _ctx.to_dict() if _ctx else {}
+    _msf_ingest_obj = _ctx.msf_result if (_ctx and _ctx.msf_result) else None
     reporter = Reporter(
         result,
         target=args.target,
@@ -1292,6 +2014,7 @@ async def _finish_pipeline(
         redirect=redirect_result,
         crlf=crlf_result,
         nosql=nosql_result,
+        sql_probe=sql_probe_result,
         auto_auth=auto_auth_session,
         auth_bypass=auth_bypass_result,
         challenges=challenge_diff,
@@ -1303,11 +2026,17 @@ async def _finish_pipeline(
         enrichment=enrichment_result,
         data_extract=data_extract_result,
         llm_verification=llm_verification_result,
+        solver=solver_result,
         upload_probe=upload_probe_result,
         sql_dump=sql_dump_result,
+        ldap_dump=ldap_dump_result,
+        scm_probe=scm_probe_result,
         ws_probe=ws_probe_result,
         ct_probe=ct_probe_result,
         auto_fuzz=auto_fuzz_result,
+        tunnel_hits=_tunnel_hits,
+        tunnel_info=_tunnel_info,
+        msf_ingest=_msf_ingest_obj,
     )
     md_path, json_path = reporter.write(str(out))
 
@@ -1330,6 +2059,8 @@ async def _finish_pipeline(
         ("Active scan", len(active_result.confirmed) if active_result else 0),
         ("Auth bypass", len(auth_bypass_result.confirmed) if auth_bypass_result else 0),
         ("NoSQL",       len(nosql_result.confirmed) if nosql_result else 0),
+        ("MSSQL",       len(sql_probe_result.confirmed) if sql_probe_result else 0),
+        ("NTLM hashes", sql_probe_result.ntlm_hashes_captured if sql_probe_result else 0),
         ("CRLF",        len(crlf_result.confirmed) if crlf_result else 0),
         ("Open redir",  len(redirect_result.confirmed) if redirect_result else 0),
         ("JWT",         len(jwt_result.confirmed) if jwt_result else 0),
@@ -1613,6 +2344,55 @@ def build_parser() -> argparse.ArgumentParser:
                               "is to stop the scan early since headless Playwright is "
                               "reliably blocked by these — set this to scan anyway "
                               "(typically gives 0 results unless paired with --har).")
+        # ── Stage 0 recon (surface_mapper) — all OFF by default ─────────
+        cmd.add_argument("--auto-scope", action="store_true",
+                         help="Run Stage 0 attack-surface expansion BEFORE stackprint: "
+                              "RDAP whois on the seed domain, passive subdomain "
+                              "enumeration (crt.sh + Wayback CDX), and ASN/CIDR "
+                              "lookup via Team Cymru. Passive only — no port scans, "
+                              "no brute force. Writes output/recon/scope.json.")
+        cmd.add_argument("--port-scan", choices=("none", "web", "full"),
+                         default="none", metavar="MODE",
+                         help="Per-host TCP port scan. 'none' (default) skips it; "
+                              "'web' tries a curated ~80-port web-app list; 'full' "
+                              "adds another ~50 non-web service ports. Refuses "
+                              "RFC1918, link-local, and shared-CDN ranges. Also "
+                              "enables Host-header vhost differencing on every "
+                              "open web port when multiple hostnames resolve to "
+                              "the same IP.")
+        cmd.add_argument("--analyze-block", action="store_true",
+                         help="Reverse-DNS sweep the ASN-owned CIDR for the seed "
+                              "host. Refuses prefixes wider than /20 unless "
+                              "--analyze-block-max is raised. Loud — only enable "
+                              "on programs whose scope clearly covers the netblock.")
+        cmd.add_argument("--analyze-block-max", type=int, default=20, metavar="N",
+                         help="Maximum CIDR width allowed for --analyze-block "
+                              "sweeps (default: 20 → /20 max, ~4k hosts). Raise "
+                              "with care.")
+        cmd.add_argument("--scope-suffix", default=None, metavar="DOMAIN",
+                         help="Override the auto-derived eTLD+1 used by --auto-scope. "
+                              "Pass this for multi-label TLDs like 'target.co.uk' "
+                              "or when you want a tighter scope than the apex domain.")
+        # ── Metasploit Framework workspace integration ───────────────────
+        msf_group = cmd.add_mutually_exclusive_group()
+        msf_group.add_argument("--msf", action="store_true",
+                               help="Force-enable Metasploit workspace integration "
+                                    "(overrides [msf].enabled in operator config). "
+                                    "Tries msfrpcd first; falls back to direct PG. "
+                                    "Pulls hosts/services/creds/loot/notes into "
+                                    "Stage 0 recon + enrichment. See [msf] in "
+                                    "hxxpsin.toml.example for the full schema.")
+        msf_group.add_argument("--no-msf", action="store_true",
+                               help="Force-disable MSF integration even when "
+                                    "operator config has [msf].enabled = true.")
+        cmd.add_argument("--msf-workspace", metavar="NAME", default=None,
+                         help="Override [msf].workspace for this run (default: "
+                              "whatever the config says, usually 'default').")
+        cmd.add_argument("--msf-push", action="store_true",
+                         help="Push confirmed hxxpsin findings back into the MSF "
+                              "workspace as vulns. Idempotent via msf_pushed.json. "
+                              "Requires the RPC backend (push not supported when "
+                              "auto-fallback lands on direct-PG).")
 
     # ── scan ──────────────────────────────────────────────────────────────
     scan = sub.add_parser("scan", help="Full pipeline (stackprint + crawl + classify + desync + enrich + report)")
@@ -1637,6 +2417,13 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Operator-supplied username override (default: derived from "
                            "the local part of --auth-email). Use when the target's login "
                            "form uses a separate `username` field distinct from email.")
+    scan.add_argument("--auth-config", metavar="PATH", default=None,
+                      help="Path to an extra operator-config TOML file. Loaded on top "
+                           "of ~/.config/hxxpsin/config.toml and ./hxxpsin.toml. "
+                           "Controls mail backends (IMAP/Mailhog/mail.tm), captcha "
+                           "handling, the public tunnel (cloudflared/ngrok/static), "
+                           "and per-target overrides (TOTP secret, real email, etc.). "
+                           "See hxxpsin.toml.example for the full schema.")
     scan.add_argument("--har",     metavar="FILE",
                       help="Skip the live crawler — import requests + responses from a "
                            "HAR file (Burp / ZAP / Chrome DevTools \"Save all as HAR with content\")")
@@ -1648,8 +2435,24 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Page-visit cap for the crawler (default: 80). Use 0 for unlimited.")
     scan.add_argument("--max-depth",  type=int, default=4,
                       help="BFS depth cap for the crawler (default: 4). Use 0 for unlimited.")
+    scan.add_argument("--phase-b-timeout", type=int, default=600, metavar="SEC",
+                      help="Wall-clock cap on Phase B (authenticated deep crawl) "
+                           "in seconds (default: 600). On timeout, Phase B is "
+                           "abandoned and the scan continues with Phase A data "
+                           "+ AutoAuth headers. Prevents Playwright deadlocks "
+                           "from burning the whole scan budget.")
     scan.add_argument("--active-scan", action="store_true",
                       help="Enable active injection testing (blind SQLi, CMDi, path traversal, XXE). Loud.")
+    scan.add_argument("--allow-windows-destructive", action="store_true",
+                      help="Enable destructive Windows probes: MSSQL xp_cmdshell loud commands "
+                           "(net user, systeminfo, dir c:\\), sp_addlogin, and DOS-reserved-name "
+                           "uploads (CON/NUL/AUX — can LOCK Windows fileshares). Also starts the "
+                           "SMB sink on --smb-port to capture NTLMv2 hashes via xp_dirtree UNC "
+                           "coercion. Off by default. Read the warnings in --help carefully.")
+    scan.add_argument("--smb-port", type=int, default=4445, metavar="PORT",
+                      help="Listen port for the NTLM-capture SMB sink (default: 4445). "
+                           "Port 445 requires root + pf/iptables redirect. Use a port-suffixed "
+                           "UNC payload (\\\\host:4445\\share) when 445 is unavailable.")
     scan.add_argument("--auto-fuzz", action="store_true",
                       help="Auto-place §markers§ on all discovered parameters and run Intruder payload "
                            "sets (IDOR→ids, Injection→sqli/xss/ssti, SSRF→redirects). "
@@ -1664,6 +2467,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Disable file-upload bypass tests (magic-byte spoof, double-ext, SVG XSS, polyglot, etc.)")
     scan.add_argument("--no-sql-dump", action="store_true",
                       help="Disable schema dump + table extract for confirmed SQLi (default: enabled when SQLi found).")
+    scan.add_argument("--no-ldap-dump", action="store_true",
+                      help="Disable LDAP/AD attribute extraction for confirmed LDAP injection (default: enabled when LDAP injection found).")
+    scan.add_argument("--no-scm-probe", action="store_true",
+                      help="Disable SCM/config exposure probe (.git/.svn/.env/wp-config.php.bak/etc).")
     scan.add_argument("--llm", action="store_true",
                       help="Enable local LLM (Ollama) to verify 'likely' findings. "
                            "Requires Ollama running at --llm-host (default localhost:11434).")
@@ -1675,6 +2482,41 @@ def build_parser() -> argparse.ArgumentParser:
                            "structured security triage). Must be pulled via `ollama pull <model>`.")
     scan.add_argument("--llm-budget", type=int, default=50, metavar="N",
                       help="Max LLM calls per scan (default: 50). Cached calls don't count.")
+    scan.add_argument("--solve", action="store_true",
+                      help="Enable the agentic solver — for each of the top findings, "
+                           "run a tool-use loop (http/browser/nuclei) to confirm or "
+                           "refute the bug. Provider is set with --solve-provider.")
+    scan.add_argument("--solve-provider", default="claude",
+                      choices=["claude", "openai", "ollama"],
+                      help="Backend for --solve. ALL providers route through "
+                           "servus's chat-complete endpoint (set "
+                           "SERVUS_AGENT_TOKEN). 'claude' / 'openai' / "
+                           "'ollama' selects which upstream servus calls; "
+                           "API keys live in servus, not here. Default: claude.")
+    scan.add_argument("--solve-model", default=None, metavar="MODEL",
+                      help="Model ID for --solve. Default depends on provider: "
+                           "claude→claude-opus-4-7, openai→gpt-5.5, "
+                           "ollama→qwen2.5:7b.")
+    scan.add_argument("--solve-top", type=int, default=5, metavar="N",
+                      help="Number of top classifier findings to hand to the solver "
+                           "(default: 5).")
+    scan.add_argument("--solve-max-turns", type=int, default=10, metavar="N",
+                      help="Max agent turns per finding (default: 10).")
+    scan.add_argument("--solve-budget", type=int, default=40, metavar="N",
+                      help="Max total Claude API calls across the whole scan "
+                           "(default: 40). Cached calls don't count.")
+    scan.add_argument("--solve-verbose", action="store_true",
+                      help="Stream every prompt, assistant turn, tool call, "
+                           "and tool result to stderr while the solver runs. "
+                           "Lets you watch Claude reason in real time.")
+    scan.add_argument("--solve-thinking", type=int, default=0, metavar="TOKENS",
+                      help="Enable Claude extended thinking with this many "
+                           "reasoning tokens per turn (e.g. 4096). 0 disables. "
+                           "When enabled, temperature is forced to 1.0 per the "
+                           "Anthropic API constraint.")
+    scan.add_argument("--nuclei-bin", default="nuclei", metavar="PATH",
+                      help="Path to the nuclei binary used by the solver's run_nuclei "
+                           "tool (default: 'nuclei' on PATH).")
     scan.add_argument("--param-mine-top", type=int, default=10, metavar="N",
                       help="Number of top endpoints to param-mine (default: 10).")
     auto_auth_group = scan.add_mutually_exclusive_group()

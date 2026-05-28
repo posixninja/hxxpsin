@@ -48,6 +48,7 @@ class Reporter:
         redirect=None,      # Optional[OpenRedirectResult]
         crlf=None,          # Optional[CRLFResult]
         nosql=None,         # Optional[NoSQLResult]
+        sql_probe=None,     # Optional[SQLProbeResult] — MSSQL + NTLM hash capture
         auto_auth=None,     # Optional[AuthSession]
         auth_bypass=None,   # Optional[AuthBypassResult]
         challenges=None,    # Optional[ChallengeTrackerResult]
@@ -59,11 +60,17 @@ class Reporter:
         enrichment=None,    # Optional[EnrichmentResult]
         data_extract=None,  # Optional[DataExtractResult]
         llm_verification=None,  # Optional[LLMVerificationResult]
+        solver=None,        # Optional[ChallengeSolverResult]
         upload_probe=None,  # Optional[UploadProbeResult]
         sql_dump=None,      # Optional[SQLDumpResult]
+        ldap_dump=None,     # Optional[LDAPDumpResult]
+        scm_probe=None,     # Optional[SCMProbeResult]
         ws_probe=None,      # Optional[WSProbeResult]
         ct_probe=None,      # Optional[CTProbeResult]
         auto_fuzz=None,     # Optional[AutoFuzzResult]
+        tunnel_hits=None,   # Optional[list[Hit]] from payload_server
+        tunnel_info=None,   # Optional[dict] — backend name + public URL
+        msf_ingest=None,    # Optional[MSFIngestResult] from msf_ingest module
     ):
         self._result = result
         self._target = target
@@ -75,6 +82,7 @@ class Reporter:
         self._redirect = redirect
         self._crlf = crlf
         self._nosql = nosql
+        self._sql_probe = sql_probe
         self._auto_auth = auto_auth
         self._auth_bypass = auth_bypass
         self._challenges = challenges
@@ -86,11 +94,17 @@ class Reporter:
         self._enrichment = enrichment
         self._data_extract = data_extract
         self._llm_verification = llm_verification
+        self._solver = solver
         self._upload_probe = upload_probe
         self._sql_dump = sql_dump
+        self._ldap_dump = ldap_dump
+        self._scm_probe = scm_probe
         self._ws_probe = ws_probe
         self._ct_probe = ct_probe
         self._auto_fuzz = auto_fuzz
+        self._tunnel_hits = tunnel_hits or []
+        self._tunnel_info = tunnel_info or {}
+        self._msf_ingest = msf_ingest
 
     # ------------------------------------------------------------------
     # Public interface
@@ -105,6 +119,32 @@ class Reporter:
 
         md_path.write_text(self.to_markdown())
         json_path.write_text(json.dumps(self.to_dict(), indent=2))
+
+        # classify.json — lossless dump of every classifier finding (incl.
+        # request headers + captured response). Consumed by the A2A
+        # `confirm_finding` skill to reconstruct a single finding for an
+        # on-demand 3-stage solver run. report.json keeps the trimmed
+        # `top_findings` so consumers that only want the summary stay
+        # cheap.
+        try:
+            classify_path = d / "classify.json"
+            classify_path.write_text(
+                json.dumps(
+                    {
+                        "target": self._target,
+                        "findings": [f.to_full_dict() for f in self._result.request_findings],
+                        "websocket_findings": [
+                            w.to_dict() for w in self._result.websocket_findings
+                        ],
+                    },
+                    indent=2,
+                )
+            )
+        except Exception:
+            # Lossless dump is best-effort; never fail the whole report write
+            # over it. The on-demand solver path falls back to "no classify.json"
+            # gracefully.
+            pass
 
         return str(md_path), str(json_path)
 
@@ -141,10 +181,14 @@ class Reporter:
             sections.append(self._section_ct_probe())
         if self._auto_fuzz and self._auto_fuzz.findings:
             sections.append(self._section_auto_fuzz())
+        if self._tunnel_hits:
+            sections.append(self._section_tunnel_hits())
         if self._active_scan and self._active_scan.findings:
             sections.append(self._section_active_scan())
         if self._nosql and self._nosql.findings:
             sections.append(self._section_nosql())
+        if self._sql_probe and self._sql_probe.findings:
+            sections.append(self._section_sql_probe())
         if self._desync and self._desync.findings:
             sections.append(self._section_desync())
         if self._result.websocket_findings:
@@ -156,14 +200,24 @@ class Reporter:
         if self._enrichment and (self._enrichment.users or self._enrichment.secrets
                                   or self._enrichment.hosts):
             sections.append(self._section_enrichment())
+        if self._msf_ingest and self._msf_has_content():
+            sections.append(self._section_msf_ingest())
         if self._data_extract and self._data_extract.records_pulled:
             sections.append(self._section_data_extract())
         if self._upload_probe and self._upload_probe.findings:
             sections.append(self._section_upload_probe())
         if self._sql_dump and (self._sql_dump.fingerprints or self._sql_dump.rows_dumped):
             sections.append(self._section_sql_dump())
+        if self._ldap_dump and (self._ldap_dump.fingerprints
+                                 or self._ldap_dump.accounts
+                                 or self._ldap_dump.confirmed_injections):
+            sections.append(self._section_ldap_dump())
+        if self._scm_probe and self._scm_probe.findings:
+            sections.append(self._section_scm_probe())
         if self._llm_verification and self._llm_verification.findings:
             sections.append(self._section_llm_verification())
+        if self._solver and self._solver.findings:
+            sections.append(self._section_solver())
         if self._profile:
             sections.append(self._section_recommended())
         return "\n\n---\n\n".join(sections) + "\n"
@@ -202,6 +256,8 @@ class Reporter:
             out["crlf"] = self._crlf.to_dict()
         if self._nosql:
             out["nosql"] = self._nosql.to_dict()
+        if self._sql_probe:
+            out["sql_probe"] = self._sql_probe.to_dict()
         if self._auto_auth:
             out["auto_auth"] = self._auto_auth.to_dict()
         if self._auth_bypass:
@@ -220,6 +276,18 @@ class Reporter:
             out["ct_probe"] = self._ct_probe.to_dict()
         if self._auto_fuzz:
             out["auto_fuzz"] = self._auto_fuzz.to_dict()
+        if self._solver:
+            out["solver"] = self._solver.to_dict()
+        if self._sql_dump:
+            out["sql_dump"] = self._sql_dump.to_dict()
+        if self._ldap_dump:
+            out["ldap_dump"] = self._ldap_dump.to_dict()
+        if self._scm_probe:
+            out["scm_probe"] = self._scm_probe.to_dict()
+        if self._msf_ingest:
+            out["msf_ingest"] = (self._msf_ingest.to_dict()
+                                 if hasattr(self._msf_ingest, "to_dict")
+                                 else self._msf_ingest)
         return out
 
     # ------------------------------------------------------------------
@@ -262,6 +330,8 @@ class Reporter:
             ("Active scan (injection)", counts["active_scan_confirmed"], self._active_scan),
             ("Auth bypass (SQLi at login)", counts["auth_bypass_confirmed"], self._auth_bypass),
             ("NoSQL injection", counts["nosql_confirmed"], self._nosql),
+            ("MSSQL (sql_probe)", counts["sql_probe_confirmed"], self._sql_probe),
+            ("NTLM hashes captured", counts["ntlm_hashes_captured"], self._sql_probe),
             ("CRLF injection", counts["crlf_confirmed"], self._crlf),
             ("Open redirect", counts["redirect_confirmed"], self._redirect),
             ("Cross-account IDOR / BOLA", counts["idor_confirmed"], self._idor),
@@ -269,6 +339,9 @@ class Reporter:
             ("WebSocket security", counts["ws_probe_confirmed"], self._ws_probe),
             ("Content-type confusion", counts["ct_probe_confirmed"], self._ct_probe),
             ("Auto-fuzz anomalies",   counts["auto_fuzz_anomalies"],  self._auto_fuzz),
+            ("LDAP injection",       counts["ldap_injections_confirmed"], self._ldap_dump),
+            ("LDAP high-value accounts (AD)", counts["ldap_high_value"],  self._ldap_dump),
+            ("SCM/config critical exposures", counts["scm_critical_exposures"], self._scm_probe),
         ]
         for label, n, present in breakdown:
             if present and n:
@@ -308,16 +381,30 @@ class Reporter:
         if not findings:
             return "## Top Findings\n\n_No findings scored._"
 
-        lines = [
-            "## Top Findings",
-            "",
-            "| Score | Method | URL | Categories |",
-            "|---|---|---|---|",
-        ]
-        for f in findings:
-            cats = ", ".join(f.categories[:2])
-            url = f.url[:80] + ("…" if len(f.url) > 80 else "")
-            lines.append(f"| {f.score} | `{f.method}` | `{url}` | {cats} |")
+        any_agent = any(getattr(f, "agent_verdict", None) for f in findings)
+        if any_agent:
+            lines = [
+                "## Top Findings",
+                "",
+                "| Score | Method | URL | Categories | Agent |",
+                "|---|---|---|---|---|",
+            ]
+            for f in findings:
+                cats = ", ".join(f.categories[:2])
+                url = f.url[:80] + ("…" if len(f.url) > 80 else "")
+                v = getattr(f, "agent_verdict", "") or "—"
+                lines.append(f"| {f.score} | `{f.method}` | `{url}` | {cats} | `{v}` |")
+        else:
+            lines = [
+                "## Top Findings",
+                "",
+                "| Score | Method | URL | Categories |",
+                "|---|---|---|---|",
+            ]
+            for f in findings:
+                cats = ", ".join(f.categories[:2])
+                url = f.url[:80] + ("…" if len(f.url) > 80 else "")
+                lines.append(f"| {f.score} | `{f.method}` | `{url}` | {cats} |")
         return "\n".join(lines)
 
     def _section_by_category(self) -> str:
@@ -409,6 +496,278 @@ class Reporter:
                 lines.append(f"- {n}")
         return "\n".join(lines)
 
+    def _section_ldap_dump(self) -> str:
+        s = self._ldap_dump
+        fp = ", ".join(f"`{f.vendor}` ({f.confidence:.2f})" for f in s.fingerprints) or "—"
+        lines = [
+            f"## LDAP/AD Dump ({len(s.accounts)} accounts, "
+            f"{len(s.high_value)} high-value tag(s))",
+            "",
+            f"**Vendor fingerprints:** {fp}",
+            f"**Confirmed boolean-blind injections:** {len(s.confirmed_injections)} "
+            f"(extraction attempts: {s.extraction_attempts}, "
+            f"successful: {s.successful_extractions})",
+            "",
+            f"For every confirmed boolean-blind LDAP injection we fingerprinted "
+            f"the directory vendor, extracted attribute values via wildcard "
+            f"filter injection, and (for Active Directory) parsed "
+            f"`userAccountControl` flags into operator-readable tags "
+            f"(KERBEROASTABLE, ASREPROASTABLE, DISABLED, DOMAIN_ADMIN, "
+            f"LAPS_READABLE, GMSA_READABLE). Per-account dumps live in "
+            f"`{s.out_dir}/accounts/`. Accounts that match a discovered "
+            f"identity were cross-linked into "
+            f"`enrichment/users/<id>/ldap/<account>.json`.",
+            "",
+        ]
+        if s.confirmed_injections:
+            lines.append("### Confirmed injection points")
+            lines.append("")
+            lines.append("| Endpoint | Param | Δ (true vs false) |")
+            lines.append("|---|---|---|")
+            for c in s.confirmed_injections[:10]:
+                delta = abs(c.true_len - c.false_len)
+                lines.append(
+                    f"| `{c.endpoint[:70]}` | `{c.param}` | "
+                    f"{delta} B |"
+                )
+            lines.append("")
+        if s.high_value:
+            lines.append(f"### High-value accounts ({len(s.high_value)})")
+            lines.append("")
+            lines.append("| Identifier | DN | Tags |")
+            lines.append("|---|---|---|")
+            for hv in s.high_value[:30]:
+                tags = ", ".join(f"`{t}`" for t in hv.get("tags", []))
+                dn = hv.get("dn") or "—"
+                if len(dn) > 60:
+                    dn = dn[:55] + "…"
+                lines.append(
+                    f"| `{hv.get('identifier', '?')}` | `{dn}` | {tags} |"
+                )
+            lines.append("")
+        if s.accounts:
+            lines.append(f"### All extracted accounts ({len(s.accounts)})")
+            lines.append("")
+            for a in s.accounts[:20]:
+                attr_count = len(a.attributes)
+                tags_str = (
+                    " — " + ", ".join(f"`{t}`" for t in a.tags) if a.tags else ""
+                )
+                lines.append(
+                    f"- `{a.identifier}` ({attr_count} attributes){tags_str}"
+                )
+            if len(s.accounts) > 20:
+                lines.append(
+                    f"- _… {len(s.accounts) - 20} more in `accounts/`_"
+                )
+            lines.append("")
+        if s.notes:
+            lines.append("**Notes:**")
+            for n in s.notes[:8]:
+                lines.append(f"- {n}")
+        return "\n".join(lines)
+
+    def _section_scm_probe(self) -> str:
+        s = self._scm_probe
+        critical = s.critical
+        lines = [
+            f"## SCM / Config Exposure ({len(s.findings)} exposure(s), "
+            f"{len(critical)} critical / "
+            f"{s.paths_probed} paths probed across {s.bases_probed} base(s))",
+            "",
+            f"Stage-0 probe walked a high-value path catalog "
+            f"(`.git/HEAD`, `.env*`, `wp-config.php.bak`, `composer.lock`, "
+            f"`.DS_Store`, `.htpasswd`, IIS `web.config`, …) against the "
+            f"target root and discovered subdirectories. Confirmation is "
+            f"shape-aware (each path has a regex its response body must "
+            f"satisfy) so SPA shells and soft-404 pages don't false-positive. "
+            f"Any `.env*` / `wp-config.php.*` bodies were swept through the "
+            f"unified [[secrets]] catalog — credential matches are listed "
+            f"per-finding below. Persisted under `{s.out_dir}/`.",
+            "",
+        ]
+        if critical:
+            lines.append(f"### Critical exposures ({len(critical)})")
+            lines.append("")
+            lines.append("| Kind | URL | Path | Secrets leaked |")
+            lines.append("|---|---|---|---|")
+            for f in critical[:20]:
+                leaks = (
+                    ", ".join(f"`{k}`" for k in f.secret_kinds_in_body[:4])
+                    or "—"
+                )
+                lines.append(
+                    f"| `{f.kind}` | `{f.url}` | `{f.path}` | {leaks} |"
+                )
+            lines.append("")
+        # Remaining (high / medium / low / info) — compact list
+        non_critical = [f for f in s.findings if f.severity != "critical"]
+        if non_critical:
+            lines.append(
+                f"### Other exposures ({len(non_critical)})"
+            )
+            lines.append("")
+            for f in non_critical[:30]:
+                lines.append(
+                    f"- **[{f.severity}]** `{f.kind}` — `{f.url}` "
+                    f"({f.note})"
+                )
+            if len(non_critical) > 30:
+                lines.append(
+                    f"- _… {len(non_critical) - 30} more in "
+                    f"`scm_probe.json`_"
+                )
+            lines.append("")
+        return "\n".join(lines)
+
+    def _section_tunnel_hits(self) -> str:
+        info = self._tunnel_info or {}
+        backend = info.get("tunnel_backend") or "?"
+        url = info.get("public_url") or "?"
+        hits = self._tunnel_hits
+        # Group by kind for at-a-glance counts
+        by_kind: dict[str, int] = {}
+        for h in hits:
+            k = getattr(h, "kind", "generic") if hasattr(h, "kind") else h.get("kind", "generic")
+            by_kind[k] = by_kind.get(k, 0) + 1
+        kind_summary = ", ".join(f"{k}={v}" for k, v in sorted(by_kind.items()))
+        lines = [
+            f"## OOB Tunnel Hits ({len(hits)} total)",
+            "",
+            f"Public tunnel `{backend}` exposed our local payload server at "
+            f"`{url}` for the duration of the scan. Targets that fetched "
+            f"this URL during SSRF / XXE / upload-callback / open-redirect "
+            f"testing produced the hits below — each is **proof** of "
+            f"server-side outbound HTTP, not just a suggestive header.",
+            "",
+            f"**Breakdown:** {kind_summary}" if kind_summary else "",
+            "",
+            "| When | Kind | Method | Path | Peer | Correlation ID |",
+            "|---|---|---|---|---|---|",
+        ]
+        for h in hits[:60]:
+            if hasattr(h, "to_dict"):
+                d = h.to_dict()
+            else:
+                d = h
+            import time as _t
+            ts = _t.strftime("%H:%M:%S", _t.localtime(d.get("received_at", 0)))
+            path = d.get("path", "")
+            if len(path) > 50:
+                path = path[:45] + "…"
+            lines.append(
+                f"| {ts} | `{d.get('kind', '-')}` | {d.get('method', '-')} | "
+                f"`{path}` | `{d.get('peer', '-')}` | "
+                f"`{d.get('correlation_id') or '-'}` |"
+            )
+        if len(hits) > 60:
+            lines.append(f"\n_…and {len(hits) - 60} more hit(s) in `tunnel_hits.json`._")
+        return "\n".join(lines)
+
+    def _msf_has_content(self) -> bool:
+        m = self._msf_ingest
+        if m is None:
+            return False
+        # Show the section as long as we connected — even zero pulls is signal
+        # (e.g. operator pointed at the wrong workspace).
+        return (bool(getattr(m, "backend", ""))
+                or bool(getattr(m, "pushed_vulns", []))
+                or int(getattr(m, "pulled_sessions", 0) or 0) > 0
+                or bool(getattr(m, "suggested_modules", {})))
+
+    def _section_msf_ingest(self) -> str:
+        m = self._msf_ingest
+        backend = getattr(m, "backend", "?") or "?"
+        ws = getattr(m, "workspace", "?") or "?"
+        pulled = [
+            ("hosts",    getattr(m, "pulled_hosts", 0)),
+            ("services", getattr(m, "pulled_services", 0)),
+            ("vulns",    getattr(m, "pulled_vulns", 0)),
+            ("creds",    getattr(m, "pulled_creds", 0)),
+            ("loot",     getattr(m, "pulled_loot", 0)),
+            ("notes",    getattr(m, "pulled_notes", 0)),
+            ("sessions", getattr(m, "pulled_sessions", 0)),
+        ]
+        pushed_vulns = list(getattr(m, "pushed_vulns", []) or [])
+        pushed_notes = list(getattr(m, "pushed_notes", []) or [])
+        pushed_loot = list(getattr(m, "pushed_loot", []) or [])
+        overlap = list(getattr(m, "overlapped_hosts", []) or [])
+        sessions_on_target = list(getattr(m, "sessions_on_target", []) or [])
+        suggested = dict(getattr(m, "suggested_modules", {}) or {})
+        notes = list(getattr(m, "notes", []) or [])
+
+        lines = [
+            f"## Metasploit workspace integration",
+            "",
+            f"**Backend:** `{backend}`   **Workspace:** `{ws}`",
+            "",
+            "| Source | Count |",
+            "|---|---|",
+        ]
+        for label, n in pulled:
+            lines.append(f"| pulled {label} | {n} |")
+        if pushed_vulns:
+            lines.append(f"| pushed vulns | {len(pushed_vulns)} |")
+        if pushed_notes:
+            lines.append(f"| pushed notes | {len(pushed_notes)} |")
+        if pushed_loot:
+            lines.append(f"| pushed loot  | {len(pushed_loot)} |")
+        lines.append("")
+
+        if overlap:
+            preview = ", ".join(f"`{h}`" for h in overlap[:10])
+            more = f" _…and {len(overlap) - 10} more_" if len(overlap) > 10 else ""
+            lines.append(
+                f"**Overlap with current scan:** {len(overlap)} host(s) "
+                f"already in this scan's surface map were also present in the "
+                f"MSF workspace — {preview}{more}."
+            )
+            lines.append("")
+
+        if pushed_vulns:
+            lines.append(
+                f"**Pushed findings** (idempotent via `msf_pushed.json`): "
+                + ", ".join(f"`{v}`" for v in pushed_vulns[:20])
+                + (f" _…+{len(pushed_vulns)-20}_" if len(pushed_vulns) > 20 else "")
+            )
+            lines.append("")
+
+        if sessions_on_target:
+            lines.append("**Live MSF sessions on this target host** "
+                         "(meterpreter/shell already open — you may already own this box):")
+            lines.append("")
+            lines.append("| ID | Type | Target | Via exploit | Opened |")
+            lines.append("|---|---|---|---|---|")
+            for s in sessions_on_target[:20]:
+                lines.append(
+                    f"| {s.get('id', '-')} | `{s.get('session_type', '-')}` | "
+                    f"`{s.get('target_host', '-')}` | `{s.get('via_exploit', '-')}` | "
+                    f"{s.get('opened_at', '-')} |"
+                )
+            lines.append("")
+
+        if suggested:
+            lines.append("**Suggested MSF modules per finding** "
+                         "(keyword hints from finding categories — feed into "
+                         "`msfconsole > search <keyword>`):")
+            lines.append("")
+            for url, hints in list(suggested.items())[:30]:
+                short_url = url if len(url) <= 80 else url[:75] + "…"
+                lines.append(f"- `{short_url}` → "
+                             + ", ".join(f"`{h}`" for h in hints))
+            if len(suggested) > 30:
+                lines.append(f"\n_…and {len(suggested) - 30} more finding(s) "
+                             f"with module hints._")
+            lines.append("")
+
+        if notes:
+            lines.append("**Warnings / soft errors:**")
+            for n in notes[:10]:
+                lines.append(f"- {n}")
+            lines.append("")
+
+        return "\n".join(lines)
+
     def _section_upload_probe(self) -> str:
         u = self._upload_probe
         lines = [
@@ -471,6 +830,108 @@ class Reporter:
                 f"| `{f.get('kind')}` | `{f.get('heuristic')}` | "
                 f"`{f.get('llm')}` | `{url}` | {reason} |"
             )
+        return "\n".join(lines)
+
+    def _section_solver(self) -> str:
+        s = self._solver
+        header_extra = ""
+        if getattr(s, "refusals", 0):
+            header_extra = f", ⚠ {s.refusals} LLM refusal(s)"
+        lines = [
+            f"## Agent Solver ({s.model}) — "
+            f"{s.confirmed} confirmed, {s.refuted} refuted, "
+            f"{s.inconclusive} inconclusive, {s.errors} errors"
+            f"{header_extra}",
+            "",
+            "Each top finding flowed through a three-stage pipeline: "
+            "**recon** (deterministic per-category probes — ID swap, "
+            "anonymous, body mutation, etc.), **briefing** (LLM condenses "
+            "raw responses into evidence-for/against), **verdict** (LLM "
+            "renders the final call from the briefing alone). The verdict "
+            "stage never sees raw HTTP transcripts, so even smaller models "
+            "stop calling 404s \"confirmed\".",
+            "",
+            f"_Token usage: {s.total_input_tokens} input / "
+            f"{s.total_output_tokens} output across {s.attempted} findings._",
+        ]
+        if getattr(s, "refusals", 0) and getattr(s, "refusal_log", None):
+            lines.append("")
+            lines.append("> ⚠ **The model refused to complete the analysis "
+                         "on one or more findings.** Verdicts for those "
+                         "findings defaulted to inconclusive. Common causes: "
+                         "the model was over-aligned for security content, "
+                         "or the briefing surfaced an exploit payload it "
+                         "wouldn't reason about. Try a different provider / "
+                         "model, or use Claude/GPT-5.5 instead of the local "
+                         "Ollama backend.")
+            lines.append("")
+            lines.append("**Refusals**:")
+            lines.append("")
+            for r in s.refusal_log[:10]:
+                exc = (r.get("raw_excerpt") or "").replace("|", "\\|")[:200]
+                lines.append(f"- finding `[{r.get('finding_index')}]` at "
+                             f"`{r.get('stage')}` stage "
+                             f"(`{r.get('kind')}`): {exc}")
+        lines += [
+            "",
+            "| # | Verdict | Conf | Recipe | Method | URL | Reason |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        order_key = lambda f: (
+            0 if f.verdict == "confirmed"
+            else 1 if f.verdict == "refuted"
+            else 2 if f.verdict == "inconclusive"
+            else 3
+        )
+        for f in sorted(s.findings, key=order_key):
+            url = f.url
+            if len(url) > 60:
+                url = url[:50] + "…" + url[-9:]
+            reason = (f.reason or "")[:140]
+            recipe = (f.recipe_name or "").replace("_", " ")
+            lines.append(
+                f"| {f.finding_index} | `{f.verdict}` | {f.confidence}/3 | "
+                f"`{recipe}` | `{f.method}` | `{url}` | {reason} |"
+            )
+        # Per-finding detail: briefing + verdict for every finding (not just
+        # confirmed ones). Reading these explains WHY the verdict is what it
+        # is — especially valuable for inconclusive verdicts where the
+        # missing_information section tells you what to probe next.
+        for f in s.findings:
+            br = (f.briefing or {})
+            lines.append("")
+            lines.append(f"### [{f.finding_index}] {f.method} {f.url} — `{f.verdict}`")
+            lines.append("")
+            lines.append(f"- _Recipe:_ `{f.recipe_name}` ({f.probes_sent} probes)")
+            if br.get("baseline_behavior"):
+                lines.append(f"- _Baseline:_ {br['baseline_behavior']}")
+            if br.get("reasoning"):
+                lines.append(f"- _Briefing reasoning:_ {br['reasoning']}")
+            if br.get("evidence_for"):
+                lines.append("- _Evidence for:_")
+                for e in br["evidence_for"]:
+                    lines.append(f"  - {e}")
+            if br.get("evidence_against"):
+                lines.append("- _Evidence against:_")
+                for e in br["evidence_against"]:
+                    lines.append(f"  - {e}")
+            if br.get("missing_information") and f.verdict == "inconclusive":
+                lines.append("- _Missing information:_")
+                for m in br["missing_information"]:
+                    lines.append(f"  - {m}")
+            if f.verdict_reasoning:
+                lines.append(f"- _Verdict reasoning:_ {f.verdict_reasoning}")
+            lines.append(f"- _Verdict summary:_ {f.reason}")
+            if f.evidence_excerpt:
+                excerpt = f.evidence_excerpt.replace("`", "'")
+                if len(excerpt) > 600:
+                    excerpt = excerpt[:600] + "…"
+                lines.append("- _Evidence excerpt:_")
+                lines.append("```")
+                lines.append(excerpt)
+                lines.append("```")
+            if f.suggested_fix:
+                lines.append(f"- _Suggested fix:_ {f.suggested_fix}")
         return "\n".join(lines)
 
     def _section_enrichment(self) -> str:
@@ -595,6 +1056,8 @@ class Reporter:
         active_c = len(self._active_scan.confirmed) if self._active_scan else 0
         auth_bypass_c = len(self._auth_bypass.confirmed) if self._auth_bypass else 0
         nosql_c = len(self._nosql.confirmed) if self._nosql else 0
+        sql_probe_c = len(self._sql_probe.confirmed) if self._sql_probe else 0
+        ntlm_hashes_c = self._sql_probe.ntlm_hashes_captured if self._sql_probe else 0
         crlf_c = len(self._crlf.confirmed) if self._crlf else 0
         redirect_c = len(self._redirect.confirmed) if self._redirect else 0
         idor_c = len(self._idor.confirmed) if self._idor else 0
@@ -602,9 +1065,30 @@ class Reporter:
         ws_probe_c = len(self._ws_probe.confirmed) if self._ws_probe else 0
         ct_probe_c = len(self._ct_probe.confirmed) if self._ct_probe else 0
         auto_fuzz_c = len(self._auto_fuzz.findings) if self._auto_fuzz else 0
+        # LDAP dump: count confirmed boolean-blind injections as exploits;
+        # high_value tags (KERBEROASTABLE / ASREPROASTABLE / DOMAIN_ADMIN /
+        # LAPS_READABLE / GMSA_READABLE) surface separately as a row.
+        ldap_inj_c = (
+            len(self._ldap_dump.confirmed_injections) if self._ldap_dump else 0
+        )
+        ldap_high_value_c = (
+            len(self._ldap_dump.high_value) if self._ldap_dump else 0
+        )
+        ldap_accounts_c = (
+            len(self._ldap_dump.accounts) if self._ldap_dump else 0
+        )
+        # SCM probe — critical exposures (env files, .git, .htpasswd,
+        # wp-config backups) count as confirmed leaks.
+        scm_critical_c = (
+            len(self._scm_probe.critical) if self._scm_probe else 0
+        )
+        scm_total_c = (
+            len(self._scm_probe.findings) if self._scm_probe else 0
+        )
         total_confirmed = (
-            jwt_c + active_c + auth_bypass_c + nosql_c
-            + crlf_c + redirect_c + idor_c + dom_xss_c + ws_probe_c + ct_probe_c + auto_fuzz_c
+            jwt_c + active_c + auth_bypass_c + nosql_c + sql_probe_c
+            + crlf_c + redirect_c + idor_c + dom_xss_c + ws_probe_c + ct_probe_c
+            + auto_fuzz_c + ldap_inj_c + scm_critical_c
         )
         return {
             "requests": sum(
@@ -623,6 +1107,8 @@ class Reporter:
             "active_scan_confirmed": active_c,
             "auth_bypass_confirmed": auth_bypass_c,
             "nosql_confirmed": nosql_c,
+            "sql_probe_confirmed": sql_probe_c,
+            "ntlm_hashes_captured": ntlm_hashes_c,
             "crlf_confirmed": crlf_c,
             "redirect_confirmed": redirect_c,
             "idor_confirmed": idor_c,
@@ -630,6 +1116,11 @@ class Reporter:
             "ws_probe_confirmed": ws_probe_c,
             "ct_probe_confirmed": ct_probe_c,
             "auto_fuzz_anomalies": auto_fuzz_c,
+            "ldap_injections_confirmed": ldap_inj_c,
+            "ldap_accounts_dumped": ldap_accounts_c,
+            "ldap_high_value": ldap_high_value_c,
+            "scm_critical_exposures": scm_critical_c,
+            "scm_total_exposures": scm_total_c,
             "total_confirmed": total_confirmed,
         }
 
@@ -979,6 +1470,41 @@ class Reporter:
             timing = f" (delay: {f.timing_delta:.1f}s)" if f.timing_delta > 0 else ""
             lines.append(f"**{icon}** `{f.url}` — param: `{f.param}` [{f.attack_type}]{timing}")
             lines.append(f"> {f.evidence}")
+            if f.response_snippet:
+                snip = f.response_snippet[:120].replace("\n", " ")
+                lines.append(f"> `{snip}`")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _section_sql_probe(self) -> str:
+        r = self._sql_probe
+        dialect = " — MSSQL dialect detected" if r.dialect_detected else ""
+        header = (f"## SQL Probe (MSSQL) "
+                  f"({len(r.confirmed)} confirmed / {r.endpoints_tested} tested"
+                  f"{dialect})")
+        lines = [header, ""]
+        if r.ntlm_hashes_captured:
+            lines.append(f"**NTLM hashes captured: {r.ntlm_hashes_captured}** "
+                         "(hashcat -m 5600 for v2, -m 5500 for v1)")
+            lines.append("")
+        for f in r.findings:
+            icon = "✓" if f.verdict == "confirmed" else "△"
+            extras = []
+            if f.timing_delta > 0:
+                extras.append(f"delay: {f.timing_delta:.1f}s")
+            if f.oob_hit:
+                extras.append(f"OOB: {f.oob_protocol or 'hit'}")
+            tail = f" ({', '.join(extras)})" if extras else ""
+            lines.append(f"**{icon}** `{f.endpoint}` — param: `{f.param}` "
+                         f"[{f.attack_type}]{tail}")
+            lines.append(f"> {f.evidence}")
+            if f.payload:
+                pay = f.payload[:140].replace("\n", " ")
+                lines.append(f"> payload: `{pay}`")
+            if f.ntlm_hash:
+                user = f.ntlm_user or "?"
+                domain = f.ntlm_domain or "?"
+                lines.append(f"> NTLM ({user}@{domain}): `{f.ntlm_hash[:80]}…`")
             if f.response_snippet:
                 snip = f.response_snippet[:120].replace("\n", " ")
                 lines.append(f"> `{snip}`")

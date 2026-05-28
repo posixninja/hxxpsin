@@ -920,36 +920,30 @@ class Enricher:
             url=url, method=method, json_path=json_path,
             snippet=snippet[:self._SNIPPET_BYTES],
         )
+        # Identity / network signals — kept inline because they fan out to
+        # different recorders (_add_to_user, _record_host_or_url) rather
+        # than into the secrets bucket.
         for m in _EMAIL_RE.finditer(text):
             self._add_to_user(email=m.group(0), prov=prov_factory(m.group(0)),
                               src_url=url)
-        for m in _JWT_RE.finditer(text):
-            self._record_secret(m.group(0), type_hint="jwt",
-                                prov=prov_factory(m.group(0)[:60] + "…"))
-        for m in _AWS_KEY_RE.finditer(text):
-            self._record_secret(m.group(0), type_hint="aws_access_key",
-                                prov=prov_factory(m.group(0)))
-        for m in _BEARER_RE.finditer(text):
-            self._record_secret(m.group(0), type_hint="bearer_header",
-                                prov=prov_factory(m.group(0)[:60] + "…"))
-        for m in _PRIVATE_KEY_RE.finditer(text):
-            self._record_secret(m.group(0), type_hint="private_key_pem",
-                                prov=prov_factory("-----BEGIN ...-----"))
-        for m in _GOOGLE_CLIENT_RE.finditer(text):
-            self._record_secret(m.group(0), type_hint="google_oauth_client_id",
-                                prov=prov_factory(m.group(0)))
-        for m in _SLACK_TOKEN_RE.finditer(text):
-            self._record_secret(m.group(0), type_hint="slack_token",
-                                prov=prov_factory(m.group(0)))
         for m in _IPV4_RE.finditer(text):
             ip = m.group(0)
-            # Skip obvious non-routable noise (0.0.0.0, broadcast)
             if ip in ("0.0.0.0", "255.255.255.255"):
                 continue
             self._record_host_or_url(ip, prov=prov_factory(ip))
         for m in _URL_RE.finditer(text):
             u = m.group(0).rstrip(".,);")
             self._record_host_or_url(u, prov=prov_factory(u[:120]))
+
+        # Credential-shaped strings — delegate to the unified [[secrets]]
+        # catalog. type_hint is the catalog kind so downstream callers can
+        # filter by exact provenance.
+        import secrets as _secrets
+        for s in _secrets.scan(text):
+            preview = s.value[:60] + "…" if len(s.value) > 60 else s.value
+            self._record_secret(
+                s.value, type_hint=s.kind, prov=prov_factory(preview),
+            )
 
     # ------------------------------------------------------------------
     # Records — coalescing + storage
@@ -1349,9 +1343,21 @@ class Enricher:
     def _write_user_folder(self, folder: Path, user: UserRecord) -> None:
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "record.json").write_text(json.dumps(user.to_dict(), indent=2))
-        (folder / "provenance.json").write_text(
-            json.dumps([p.to_dict() for p in user.provenance], indent=2)
-        )
+        # provenance.json — every source we saw this user in. MSF-sourced
+        # rows surface as method == "MSF" + url == "msf://<workspace>" so
+        # downstream consumers can filter on those without re-parsing.
+        prov_entries = [p.to_dict() for p in user.provenance]
+        msf_sources = sorted({
+            p.get("url", "") for p in prov_entries
+            if isinstance(p.get("url"), str) and p["url"].startswith("msf://")
+        })
+        prov_doc: dict | list = prov_entries
+        if msf_sources:
+            prov_doc = {
+                "msf_sources": msf_sources,
+                "entries": prov_entries,
+            }
+        (folder / "provenance.json").write_text(json.dumps(prov_doc, indent=2))
         if user.linked_urls:
             (folder / "linked_urls.txt").write_text(
                 "\n".join(sorted(user.linked_urls)) + "\n"

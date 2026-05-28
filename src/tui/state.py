@@ -46,6 +46,37 @@ class AppState:
     canary_tag_map: dict[str, str] = field(default_factory=dict)
     challenge_triggers: list[dict] = field(default_factory=list)
 
+    # Surface mapper / DNS recon (scope.json carries both)
+    scope: dict = field(default_factory=dict)
+
+    # OOB infrastructure
+    tunnel_hits: list[dict] = field(default_factory=list)
+    tunnel_context: dict = field(default_factory=dict)
+    tunnel_backend: str = ""
+    tunnel_public_url: str = ""
+
+    # Metasploit Framework workspace
+    msf_backend: str = ""          # "rpc" | "db" | ""
+    msf_workspace: str = ""
+    msf_result: dict = field(default_factory=dict)   # MSFIngestResult.to_dict()
+    msf_step_log: list[str] = field(default_factory=list)
+    msf_sessions_on_target: list[dict] = field(default_factory=list)
+    msf_suggested_modules: dict = field(default_factory=dict)
+
+    # LDAP / AD dump
+    ldap_dump: dict = field(default_factory=dict)
+    ldap_accounts: list[dict] = field(default_factory=list)
+
+    # SQL dump (from sql_dump.py — post-step after confirmed SQLi)
+    sql_dump: dict = field(default_factory=dict)
+    sql_dump_rows: dict[str, list] = field(default_factory=dict)  # table → rows
+
+    # AI briefings keyed by finding index (from solver.json findings[].briefing)
+    briefings: dict[int, dict] = field(default_factory=dict)
+
+    # LLM agentic decisions (challenge solver + briefing generator)
+    llm_decisions: list[dict] = field(default_factory=list)
+
     # Saved targets
     targets: list[dict] = field(default_factory=list)
 
@@ -121,6 +152,28 @@ class AppState:
         elif event == "challenge":
             self.challenge_triggers.append(args[0])
             self.emit("challenge", args[0])
+        elif event == "tunnel_up":
+            backend, public_url = args[0], args[1]
+            self.tunnel_backend = backend or ""
+            self.tunnel_public_url = public_url or ""
+            self.emit("tunnel_up", {"backend": backend, "public_url": public_url})
+        elif event == "tunnel_hit":
+            hit = args[0]
+            if isinstance(hit, dict):
+                self.tunnel_hits.append(hit)
+                self.emit("tunnel_hit", hit)
+        elif event == "surface_step":
+            phase, count = args[0], args[1]
+            self.emit("surface_step", {"phase": phase, "count": count})
+        elif event == "msf_ingest_step":
+            phase, count = args[0], args[1] if len(args) > 1 else 0
+            self.msf_step_log.append(f"{phase}: {count}")
+            self.emit("msf_ingest_step", {"phase": phase, "count": count})
+        elif event == "llm_decision":
+            decision = args[0]
+            if isinstance(decision, dict):
+                self.llm_decisions.append(decision)
+                self.emit("llm_decision", decision)
 
     def _load_collector(self, p: Path) -> None:
         collector_path = p / "collector.json"
@@ -199,8 +252,112 @@ class AppState:
                     if isinstance(f, dict) and f not in self.findings:
                         f.setdefault("_probe", "report")
                         self.findings.append(f)
+                sql = rdata.get("sql_dump")
+                if isinstance(sql, dict) and not self.sql_dump:
+                    self.sql_dump = sql
+                msf = rdata.get("msf_ingest")
+                if isinstance(msf, dict):
+                    self.msf_result = msf
+                    self.msf_backend = msf.get("backend", "") or ""
+                    self.msf_workspace = msf.get("workspace", "") or ""
+                    sot = msf.get("sessions_on_target") or []
+                    self.msf_sessions_on_target = [s for s in sot if isinstance(s, dict)]
+                    sug = msf.get("suggested_modules") or {}
+                    self.msf_suggested_modules = sug if isinstance(sug, dict) else {}
             except Exception as e:
                 self.step_log.append(f"[load error] report.json: {e}")
+
+        scope_fp = p / "recon" / "scope.json"
+        if scope_fp.exists():
+            try:
+                self.scope = json.loads(scope_fp.read_text())
+            except Exception as e:
+                self.step_log.append(f"[load error] recon/scope.json: {e}")
+
+        tunnel_fp = p / "tunnel_hits.json"
+        if tunnel_fp.exists():
+            try:
+                tdata = json.loads(tunnel_fp.read_text())
+                self.tunnel_hits = list(tdata.get("hits", []))
+                self.tunnel_context = tdata.get("context", {}) or {}
+                self.tunnel_backend = self.tunnel_context.get("tunnel_backend", "") or ""
+                self.tunnel_public_url = self.tunnel_context.get("public_url", "") or ""
+            except Exception as e:
+                self.step_log.append(f"[load error] tunnel_hits.json: {e}")
+
+        ldap_fp = p / "ldap_dump.json"
+        if ldap_fp.exists():
+            try:
+                self.ldap_dump = json.loads(ldap_fp.read_text())
+                self.ldap_accounts = list(self.ldap_dump.get("accounts", []))
+            except Exception as e:
+                self.step_log.append(f"[load error] ldap_dump.json: {e}")
+        accounts_dir = p / "ldap_dump" / "accounts"
+        if accounts_dir.is_dir() and not self.ldap_accounts:
+            for af in accounts_dir.glob("*.json"):
+                try:
+                    self.ldap_accounts.append(json.loads(af.read_text()))
+                except Exception as e:
+                    self.step_log.append(f"[load error] {af.name}: {e}")
+
+        # SQL dump — summary lives inside report.json["sql_dump"]; per-table
+        # row payloads live as <out>/sql_dump/data/<table>.json
+        sql_fp_summary = p / "sql_dump.json"
+        if sql_fp_summary.exists():
+            try:
+                self.sql_dump = json.loads(sql_fp_summary.read_text())
+            except Exception as e:
+                self.step_log.append(f"[load error] sql_dump.json: {e}")
+        sql_data_dir = p / "sql_dump" / "data"
+        if sql_data_dir.is_dir():
+            for tf in sql_data_dir.glob("*.json"):
+                try:
+                    self.sql_dump_rows[tf.stem] = json.loads(tf.read_text())
+                except Exception as e:
+                    self.step_log.append(f"[load error] {tf.name}: {e}")
+        sql_fp_text = p / "sql_dump" / "fingerprint.json"
+        if not self.sql_dump and sql_fp_text.exists():
+            try:
+                self.sql_dump = {
+                    "fingerprints": json.loads(sql_fp_text.read_text()),
+                    "out_dir": str(p / "sql_dump"),
+                }
+            except Exception as e:
+                self.step_log.append(f"[load error] sql_dump/fingerprint.json: {e}")
+
+        solver_fp = p / "solver.json"
+        url_briefings: dict[tuple[str, str], dict] = {}
+        if solver_fp.exists():
+            try:
+                sdata = json.loads(solver_fp.read_text())
+                for sf in sdata.get("findings", []):
+                    if not isinstance(sf, dict):
+                        continue
+                    br = sf.get("briefing")
+                    if not isinstance(br, dict):
+                        continue
+                    idx = int(sf.get("finding_index", -1))
+                    if idx >= 0:
+                        self.briefings[idx] = br
+                    key = (
+                        str(sf.get("url", "")),
+                        str(sf.get("method", "")).upper(),
+                    )
+                    if key[0]:
+                        url_briefings[key] = br
+            except Exception as e:
+                self.step_log.append(f"[load error] solver.json: {e}")
+        if url_briefings:
+            for f in self.findings:
+                if not isinstance(f, dict) or f.get("_briefing"):
+                    continue
+                key = (
+                    str(f.get("url", f.get("endpoint", ""))),
+                    str(f.get("method", "GET")).upper(),
+                )
+                br = url_briefings.get(key)
+                if br is not None:
+                    f["_briefing"] = br
 
         self.scan_status = "done"
         # Single event — app listens and refreshes all screens

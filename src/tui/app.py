@@ -24,9 +24,14 @@ from .screens.findings import FindingsScreen
 from .screens.enrichment import EnrichmentScreen, LoadAuthIntoRepeater
 from .screens.repeater import RepeaterScreen
 from .screens.intruder import IntruderScreen
+from .screens.ldap import LDAPScreen
+from .screens.sql_dump import SQLDumpScreen
+from .screens.llm import LLMScreen
 from .screens.probes import ProbesScreen
+from .screens.recon import ReconScreen
 from .screens.report import ReportScreen
 from .widgets.context_panel import ContextPanel
+from .widgets.finding_detail import FindingDetail
 from .widgets.params_panel import ParamsPanel
 
 
@@ -84,8 +89,13 @@ class AlertsBar(Horizontal):
         padding: 0 1;
     }
     AlertsBar #alerts-label {
-        height: 2;
+        height: 1;
         color: $warning;
+        content-align: left middle;
+    }
+    AlertsBar #oob-label {
+        height: 1;
+        color: $success;
         content-align: left middle;
     }
     """
@@ -96,6 +106,7 @@ class AlertsBar(Horizontal):
             yield Label("", id="step-label")
             yield ProgressBar(total=13, show_eta=False, show_percentage=False, id="scan-bar")
         with Vertical(id="alerts-col"):
+            yield Label("OOB: (none)", id="oob-label")
             yield Label("Alerts: (none)", id="alerts-label")
 
     def on_mount(self) -> None:
@@ -127,6 +138,16 @@ class AlertsBar(Horizontal):
 
     def update_status(self, msg: str) -> None:
         self.query_one("#scan-idle-label", Label).update(msg)
+
+    def set_oob(self, backend: str, public_url: str) -> None:
+        # Trim URLs that are too long for the 44-col alerts column.
+        url = public_url or "(no public URL)"
+        if len(url) > 32:
+            url = url[:29] + "…"
+        self.query_one("#oob-label", Label).update(f"OOB: {backend} {url}")
+
+    def flash_tunnel_hit(self, kind: str, count: int) -> None:
+        self.query_one("#oob-label", Label).update(f"OOB hit ×{count}: {kind}")
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +215,8 @@ class HxxpsinApp(App):
                 yield DashboardScreen(self._state, id="screen-dashboard")
             with TabPane("Spider", id="tab-spider"):
                 yield SpiderScreen(self._state, id="screen-spider")
+            with TabPane("Recon", id="tab-recon"):
+                yield ReconScreen(self._state, id="screen-recon")
             with TabPane("Findings", id="tab-findings"):
                 yield FindingsScreen(self._state, id="screen-findings")
             with TabPane("Enrichment", id="tab-enrichment"):
@@ -204,6 +227,12 @@ class HxxpsinApp(App):
                 yield IntruderScreen(self._state, id="screen-intruder")
             with TabPane("Probes", id="tab-probes"):
                 yield ProbesScreen(self._state, id="screen-probes")
+            with TabPane("AD/LDAP", id="tab-ldap"):
+                yield LDAPScreen(self._state, id="screen-ldap")
+            with TabPane("DB Dump", id="tab-sqldump"):
+                yield SQLDumpScreen(self._state, id="screen-sqldump")
+            with TabPane("LLM", id="tab-llm"):
+                yield LLMScreen(self._state, id="screen-llm")
             with TabPane("Report", id="tab-report"):
                 yield ReportScreen(self._state, id="screen-report")
         yield AlertsBar(id="alerts-bar")
@@ -372,9 +401,17 @@ class HxxpsinApp(App):
 
             self.call_from_thread(_start)
 
+            import inspect as _inspect
+            sig = _inspect.signature(runner)
+            extra_kwargs: dict[str, Any] = {}
+            if "state_requests" in sig.parameters:
+                extra_kwargs["state_requests"] = list(self._state.requests)
+            if "out_dir" in sig.parameters:
+                extra_kwargs["out_dir"] = self._state.out_dir
+
             loop = asyncio.new_event_loop()
             try:
-                findings = loop.run_until_complete(runner(req))
+                findings = loop.run_until_complete(runner(req, **extra_kwargs))
             finally:
                 loop.close()
 
@@ -432,6 +469,99 @@ class HxxpsinApp(App):
                     pass
             self.call_from_thread(_err)
 
+    # ── on-demand AI briefing (Finding tab "Brief" button) ───────────────
+
+    @work(thread=True)
+    def _run_quick_brief(self, finding: dict, target: str) -> None:
+        """Call briefing_generator.quick_brief_finding in a worker thread."""
+        try:
+            src_path = str(Path(__file__).resolve().parents[1])
+            if src_path not in sys.path:
+                sys.path.insert(0, src_path)
+
+            import os as _os
+            from briefing_generator import quick_brief_finding
+
+            # All providers route through servus now; the shim'd ClaudeClient
+            # / OpenAIClient just set provider=... on the wrapped
+            # ServusLLMClient. Pick the provider from operator config (or
+            # default to claude).
+            servus_token = _os.environ.get("SERVUS_AGENT_TOKEN")
+            cfg_provider = "claude"
+            try:
+                import auth_config
+
+                _cfg = auth_config.load()
+                cfg_provider = (_cfg.servus.default_provider or "claude").lower()
+                if _cfg.servus.agent_token:
+                    servus_token = _cfg.servus.agent_token
+            except Exception:
+                pass
+
+            if not servus_token:
+                def _no_token() -> None:
+                    self.notify(
+                        "Brief: no SERVUS_AGENT_TOKEN — start servus and set the "
+                        "bearer (or configure [servus] in hxxpsin.toml).",
+                        severity="error", timeout=10,
+                    )
+                self.call_from_thread(_no_token)
+                return
+
+            if cfg_provider == "openai":
+                from openai_client import OpenAIClient
+
+                client = OpenAIClient(
+                    model="gpt-5",
+                    cache_dir=None, budget=2,
+                    timeout=120.0, max_tokens=2048, verbose=False,
+                )
+            else:
+                from claude_client import ClaudeClient
+
+                client = ClaudeClient(
+                    model="claude-opus-4-7",
+                    cache_dir=None, budget=2,
+                    timeout=120.0, max_tokens=2048, verbose=False,
+                )
+            provider = cfg_provider
+            llm_generate = client.generate
+
+            loop = asyncio.new_event_loop()
+            try:
+                async def _go():
+                    async with client:
+                        return await quick_brief_finding(
+                            finding=finding, target=target,
+                            llm_generate=llm_generate,
+                        )
+
+                briefing = loop.run_until_complete(_go())
+            finally:
+                loop.close()
+
+            def _apply(br=briefing.to_dict()) -> None:
+                finding["_briefing"] = br
+                # Reload the detail widget against the same finding so the
+                # AI Briefing tab refreshes immediately.
+                try:
+                    for detail in self.query(FindingDetail):
+                        if getattr(detail, "_current", None) is finding:
+                            detail.show_finding(finding)
+                except Exception:
+                    pass
+                self.notify(
+                    f"Briefing complete ({provider}): {br.get('preliminary_hypothesis', '?')}",
+                    timeout=6,
+                )
+
+            self.call_from_thread(_apply)
+
+        except Exception as exc:
+            def _err(exc=exc) -> None:
+                self.notify(f"Brief error: {exc}", severity="error", timeout=10)
+            self.call_from_thread(_err)
+
     # ── pipeline event handler (called from background thread) ───────────
 
     def _on_pipeline_event(self, event: str, *args) -> None:
@@ -469,6 +599,61 @@ class HxxpsinApp(App):
                     pass
             self.call_from_thread(_upd_chal)
 
+        elif event == "tunnel_up":
+            backend, public_url = args[0], args[1]
+            def _upd_tup(b=backend, u=public_url) -> None:
+                try:
+                    self.query_one("#alerts-bar", AlertsBar).set_oob(b, u)
+                except NoMatches:
+                    pass
+                try:
+                    self.query_one("#screen-recon").refresh_data()
+                except (NoMatches, AttributeError):
+                    pass
+            self.call_from_thread(_upd_tup)
+
+        elif event == "tunnel_hit":
+            kind = (args[0].get("kind") if isinstance(args[0], dict) else "") or "hit"
+            count = len(self._state.tunnel_hits)
+            def _upd_thit(k=kind, n=count) -> None:
+                try:
+                    self.query_one("#alerts-bar", AlertsBar).flash_tunnel_hit(k, n)
+                except NoMatches:
+                    pass
+                try:
+                    self.query_one("#screen-recon").refresh_data()
+                except (NoMatches, AttributeError):
+                    pass
+            self.call_from_thread(_upd_thit)
+
+        elif event == "surface_step":
+            phase, count = args[0], args[1]
+            def _upd_surf(p=phase, c=count) -> None:
+                try:
+                    self.query_one("#screen-recon").refresh_data()
+                except (NoMatches, AttributeError):
+                    pass
+                try:
+                    bar = self.query_one("#alerts-bar", AlertsBar)
+                    bar.update_status(f"Surface: {p} ({c})")
+                except NoMatches:
+                    pass
+            self.call_from_thread(_upd_surf)
+
+        elif event == "llm_decision":
+            decision = args[0] if args else {}
+            def _upd_llm(d=decision) -> None:
+                try:
+                    self.query_one("#screen-llm").refresh_data()
+                except (NoMatches, AttributeError):
+                    pass
+                if isinstance(d, dict) and d.get("stage") == "verdict":
+                    self.notify(
+                        f"LLM verdict: {d.get('verdict', '?')} — {(d.get('reason') or '')[:80]}",
+                        timeout=4,
+                    )
+            self.call_from_thread(_upd_llm)
+
     # ── scan runner ───────────────────────────────────────────────────────
 
     @work(thread=True, exclusive=True)
@@ -490,9 +675,9 @@ class HxxpsinApp(App):
                 auth_headers=None,
                 auth_name=None,
                 auth_email_domain=None,
-                auth_email=None,
-                auth_password=None,
-                auth_username=None,
+                auth_email=config.get("auth_email"),
+                auth_password=config.get("auth_password"),
+                auth_username=config.get("auth_username"),
                 active_scan=config.get("active_scan", False),
                 auto_fuzz=config.get("auto_fuzz", False),
                 allow_writes=config.get("allow_writes", False),
@@ -519,7 +704,27 @@ class HxxpsinApp(App):
                 # Scope fields (used by crawl pipeline to populate CrawlConfig)
                 allowed_hosts=config.get("allowed_hosts", []),
                 excluded_patterns=config.get("excluded_patterns", []),
+                # Stage 0 — surface mapper
+                auto_scope=config.get("auto_scope", False),
+                analyze_block=config.get("analyze_block", False),
+                port_scan=config.get("port_scan", "none"),
+                # LLM solver
+                solve=config.get("solve", False),
+                solve_provider=config.get("solve_provider", "claude"),
+                solve_model=config.get("solve_model"),
+                solve_top=5,
+                solve_max_turns=12,
+                solve_budget=4.0,
+                solve_verbose=False,
             )
+
+            # OOB tunnel backend — surfaced via env var so the auth_config
+            # loader picks it up without forcing the operator to maintain a
+            # second hxxpsin.toml just for the TUI.
+            import os as _os
+            tb = (config.get("tunnel_backend") or "none").lower()
+            if tb != "none":
+                _os.environ["HXXPSIN_TUNNEL_BACKEND"] = tb
 
             # Monkey-patch CrawlConfig construction in the pipeline to inject scope.
             # We do this by patching the crawler module's CrawlConfig after import,
@@ -671,6 +876,14 @@ class HxxpsinApp(App):
                 )
         pass  # Spider manages its own lifecycle
 
+        # Tear down the MCP subprocess if the dashboard chat opened one.
+        chat_ctrl = getattr(self, "_chat_controller_instance", None)
+        if chat_ctrl is not None:
+            try:
+                chat_ctrl.stop()
+            except Exception:
+                pass
+
         self.workers.cancel_all()
         self.exit()
         # Force-exit after 2 s if threads are still alive
@@ -700,11 +913,21 @@ class HxxpsinApp(App):
 
     def _refresh_all(self) -> None:
         for screen_id in [
-            "screen-dashboard", "screen-spider",
-            "screen-findings", "screen-enrichment", "screen-probes", "screen-report",
+            "screen-dashboard", "screen-spider", "screen-recon",
+            "screen-findings", "screen-enrichment", "screen-probes",
+            "screen-ldap", "screen-sqldump", "screen-llm", "screen-report",
         ]:
             try:
                 widget = self.query_one(f"#{screen_id}")
                 widget.refresh_data()
             except (NoMatches, AttributeError):
+                pass
+
+        if self._state.tunnel_backend or self._state.tunnel_public_url:
+            try:
+                self.query_one("#alerts-bar", AlertsBar).set_oob(
+                    self._state.tunnel_backend or "—",
+                    self._state.tunnel_public_url or "",
+                )
+            except NoMatches:
                 pass

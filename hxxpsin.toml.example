@@ -1,0 +1,163 @@
+# hxxpsin operator config — copy to one of:
+#   ~/.config/hxxpsin/config.toml   (personal, recommended; chmod 600)
+#   ./hxxpsin.toml                  (per-project; gitignored)
+#
+# Per-target settings auto-match by longest hostname suffix against the
+# [targets.*] keys below. Any *_pass / *_secret / *_token field can be left
+# blank in the file and supplied via env var instead:
+#   HXXPSIN_MAIL_DEFAULT_IMAP_PASS=...
+#   HXXPSIN_TUNNEL_AUTH_TOKEN=...
+#   HXXPSIN_TARGETS_ACME_STAGING_COM_TOTP_SECRET=...
+
+
+# ── Mail backends ─────────────────────────────────────────────────────────
+# Define one [mail.<name>] block per inbox you want to be able to read.
+# Targets reference these by name via `mail = "<name>"`.
+
+[mail.default]
+backend     = "imap"
+imap_host   = "imap.fastmail.com"
+imap_port   = 993
+imap_user   = "pentest+catchall@example.com"
+imap_pass   = ""                    # set HXXPSIN_MAIL_DEFAULT_IMAP_PASS
+imap_folder = "INBOX"
+imap_ssl    = true
+
+# [mail.local]
+# backend     = "mailhog"
+# mailhog_url = "http://localhost:8025"
+
+# [mail.disposable]
+# backend = "mailtm"                # auto-creates a throwaway inbox per scan
+
+
+# ── Public tunnel ─────────────────────────────────────────────────────────
+# Exposes the local payload server (below) to the public internet so targets
+# can reach back to it for SSRF/XXE/upload/redirect probes.
+
+[tunnel]
+backend = "cloudflared"             # cloudflared | ngrok | static | none
+binary  = "cloudflared"             # PATH lookup; trycloudflare needs no auth
+# For ngrok:
+# auth_token = ""                   # set HXXPSIN_TUNNEL_AUTH_TOKEN
+# region     = "us"
+# For static (operator runs their own VPS callback):
+# public_url = "https://callback.example.com"
+
+
+# ── Local payload server ──────────────────────────────────────────────────
+# Small aiohttp app that serves SSRF redirect chains, hosted XXE DTDs, file
+# upload echo endpoints, etc. The tunnel forwards public traffic to this.
+
+[payload_server]
+host        = "127.0.0.1"
+port        = 0                     # 0 = pick a free port at start
+payload_dir = "~/.config/hxxpsin/payloads"
+
+
+# ── Captcha handling ──────────────────────────────────────────────────────
+# How to handle captchas detected on login/register forms.
+#   "human"   = open a headed Playwright browser, operator solves it manually,
+#               we capture the resulting session (recommended)
+#   "service" = paid API backend (2Captcha / AntiCaptcha) — not yet implemented
+#   "none"    = detect and skip; AutoAuth falls back to --auth credentials
+
+[captcha]
+mode    = "human"
+timeout = 600                       # seconds operator is allowed to take
+# snapshot_path = "output/manual-auth.json"   # override default location
+
+
+# ── Metasploit Framework workspace ────────────────────────────────────────
+# Pulls hosts/services/creds/loot/notes from an MSF workspace into Stage 0
+# recon + enrichment. Optionally pushes confirmed hxxpsin findings back as
+# MSF vulns. RPC (msfrpcd) is tried first; falls back to direct Postgres if
+# msfrpcd is unreachable. Both runtime deps are optional:
+#   pip install msgpack          # for RPC
+#   pip install "psycopg[binary]" # for DB fallback
+
+# [msf]
+# enabled         = true
+# rpc_host        = "127.0.0.1"
+# rpc_port        = 55553
+# rpc_user        = "msf"
+# rpc_pass        = ""              # set HXXPSIN_MSF_RPC_PASS
+# rpc_ssl         = true            # msfrpcd defaults to self-signed HTTPS
+# db_host         = "127.0.0.1"     # used only if RPC is unreachable
+# db_port         = 5432
+# db_name         = "msf"
+# db_user         = "msf"
+# db_pass         = ""              # set HXXPSIN_MSF_DB_PASS
+# workspace       = "default"
+# pull_hosts      = true
+# pull_creds      = true
+# pull_loot       = true
+# pull_notes      = true
+# pull_sessions   = true            # pull live `session.list` — warns if MSF
+#                                   # already has meterpreter on the target host
+# suggest_modules = true            # emit per-finding MSF module keyword hints
+#                                   # in the report (e.g. SSRF → ssrf/fetch)
+# push_findings   = false           # write hxxpsin findings back as MSF vulns
+# push_min_score  = 50              # only push findings at/above this score
+
+
+# ── Servus LLM gateway ────────────────────────────────────────────────────
+# All hxxpsin LLM traffic (verifier, solver, briefing) routes through
+# servus's cognition-gated chat-complete endpoint. ANTHROPIC_API_KEY /
+# OPENAI_API_KEY are NOT read here anymore — servus holds those.
+#
+# Env-var overrides (any of these win over the values in this file):
+#   SERVUS_ASSISTANT_URL       — base URL (default http://127.0.0.1:9847)
+#   SERVUS_AGENT_TOKEN         — bearer token sent to servus
+#   HXXPSIN_INITIATOR_SUBJECT  — caller subject string for audit/cognitiond
+#   HXXPSIN_DEFAULT_LLM_PROVIDER — claude | openai | ollama
+
+[servus]
+url               = "http://127.0.0.1:9847"
+agent_token_env   = "SERVUS_AGENT_TOKEN"     # name of env var
+initiator_subject = "operator@hxxpsin"
+default_provider  = "claude"                 # claude | openai | ollama
+
+
+# ── SecurisNexus identity / cognitiond gate ───────────────────────────────
+# When hxxpsin runs as an SN-registered workload, register.sh writes
+# {SECURISNEXUS_STATE_DIR}/hxxpsin.json with identity_id, spiffe_id,
+# company_id, bootstrap_token. Cognitiond gates inbound MCP/A2A calls
+# (NOT outbound probe traffic — that's gated by your authz scope of
+# work, not by SN policy).
+#
+# Env vars (env wins over file):
+#   COGNITIOND_URL                       — default http://127.0.0.1:9451
+#   HXXPSIN_COGNITION_CLIENT_CERT/KEY    — mTLS SVID files
+#   HXXPSIN_COGNITION_CA_PATH            — CA bundle (defaults to system trust)
+#   HXXPSIN_COGNITION_INSECURE=1         — DEV ONLY: disable TLS verification
+#                                          AND allow all inbound calls
+#   SECURISNEXUS_STATE_DIR               — where to find hxxpsin.json
+
+[securisnexus]
+state_dir = "~/Desktop/Projects/servus/securisnexus/state"
+scope_prefix = "assistant:tool:hxxpsin"
+
+
+# ── A2A server bind ───────────────────────────────────────────────────────
+# Where the hxxpsin A2A HTTP server listens. Servus's A2A client hits the
+# same URL to discover skills and submit tasks.
+
+[a2a]
+host = "127.0.0.1"
+port = 9851
+
+
+# ── Per-target overrides ──────────────────────────────────────────────────
+# Hostname-suffix match (longest wins). `mail` references a [mail.<name>]
+# block above.
+
+# [targets."acme-staging.com"]
+# mail        = "default"
+# email       = "pentest+acme@example.com"
+# username    = "pentester"
+# password    = ""                  # set HXXPSIN_TARGETS_ACME_STAGING_COM_PASSWORD
+# totp_secret = ""                  # base32 from QR provisioning; env override available
+
+# [targets."ctf.local"]
+# mail = "local"                    # mailhog on the test VM
