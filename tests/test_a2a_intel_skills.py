@@ -71,9 +71,12 @@ async def test_intel_msf_advertised(client):
 
 
 @pytest.mark.asyncio
-async def test_intel_msf_returns_disabled_error_when_unconfigured(client, tmp_path):
+async def test_intel_msf_returns_disabled_error_when_unconfigured(client, tmp_path, monkeypatch):
     """The default MSFProfile has enabled=False, so the skill should
     return a clean error rather than trying to connect."""
+    # Neutralize the ambient config search chain (~/.config + cwd/hxxpsin.toml)
+    # so a dev machine's real [msf] block can't leak in and flip enabled=True.
+    monkeypatch.setattr("auth_config.default_paths", lambda cwd=None: [])
     # Empty config — uses default MSFProfile (enabled=False)
     cfg_path = tmp_path / "hxxpsin.toml"
     cfg_path.write_text("")

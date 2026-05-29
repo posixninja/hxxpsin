@@ -103,7 +103,7 @@ class InboundGate:
             return CommitToken(commit_id=None)
 
         initiator, chain, ticket, session_id = _extract_caller(metadata, self._agent_actor_id)
-        scope = f"ai:chat:{self._scope_prefix}:{tool_name}"
+        scope = f"{self._scope_prefix}:{tool_name}"
         body = {
             "arguments": dict(arguments) if arguments else {},
             "initiator": initiator,
