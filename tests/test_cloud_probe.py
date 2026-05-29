@@ -135,7 +135,7 @@ def test_bucket_listing_critical_when_xml_returned():
                 "<?xml version='1.0'?><ListBucketResult><Name>acme</Name></ListBucketResult>"
             )
         return _StubResponse(404, "")
-    result = _drive(responder)
+    result = _drive(responder, target="https://acme.com/")
     buckets = [f for f in result.findings
                 if f.surface == "bucket_exposure" and f.severity == "critical"]
     assert buckets, f"expected critical bucket finding, got {[f.surface for f in result.findings]}"
@@ -161,7 +161,7 @@ def test_bucket_403_access_denied_yields_info():
             return _StubResponse(403,
                 "<Error><Code>AccessDenied</Code></Error>")
         return _StubResponse(404, "")
-    result = _drive(responder)
+    result = _drive(responder, target="https://acme.com/")
     info = [f for f in result.findings
              if f.surface == "bucket_exposure" and f.severity == "info"]
     assert info

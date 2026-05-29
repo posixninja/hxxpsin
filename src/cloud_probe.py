@@ -293,8 +293,8 @@ class CloudProbe:
 
     @staticmethod
     def _company_from_host(netloc: str) -> str:
-        """Strip TLD + ``www.`` to get the company-level label.
-        ``api.acme.example.com`` → ``acme``."""
+        """Return the registrable domain's main label (company-level).
+        ``www.acme.com`` → ``acme``; ``api.acme.com`` → ``acme``."""
         host = netloc.split(":", 1)[0].lower()
         # Drop port
         parts = host.split(".")
