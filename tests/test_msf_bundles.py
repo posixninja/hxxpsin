@@ -66,11 +66,11 @@ def test_bundle_b_sessions_overlap_with_target_host():
     that they may already own the box."""
     sessions = [
         MSFSession(id=1, session_type="meterpreter",
-                   target_host="target.example.com",
+                   target_host="ctf.corp.local",
                    via_exploit="exploit/unix/webapp/foo",
                    opened_at="2026-05-23 10:00:00"),
         MSFSession(id=2, session_type="shell",
-                   target_host="other.example.org",
+                   target_host="other.local",
                    via_exploit="exploit/multi/handler"),
     ]
     fake = FakeSessionClient(workspace="default", sessions=sessions)
@@ -80,14 +80,14 @@ def test_bundle_b_sessions_overlap_with_target_host():
     def log_cb(ev, fields): events.append((ev, fields))
 
     asyncio.run(pull_sessions_into_result(
-        fake, "https://target.example.com/login", "default", result,
+        fake, "https://ctf.corp.local/login", "default", result,
         log_cb=log_cb,
     ))
 
     assert result.pulled_sessions == 2
     assert len(result.sessions_on_target) == 1
     assert result.sessions_on_target[0]["id"] == 1
-    assert result.sessions_on_target[0]["target_host"] == "target.example.com"
+    assert result.sessions_on_target[0]["target_host"] == "ctf.corp.local"
     # Event fired with both counts
     assert any(ev == "msf_pull"
                and fields.get("sessions") == 2
@@ -105,7 +105,7 @@ def test_bundle_b_sessions_no_target_overlap():
     result = MSFIngestResult(backend="fake")
 
     asyncio.run(pull_sessions_into_result(
-        fake, "https://target.example.com/", "default", result,
+        fake, "https://ctf.corp.local/", "default", result,
     ))
     assert result.pulled_sessions == 1
     assert result.sessions_on_target == []
@@ -115,7 +115,7 @@ def test_bundle_b_pull_sessions_no_client_is_noop():
     """client=None must not raise and must not touch the result."""
     result = MSFIngestResult()
     out = asyncio.run(pull_sessions_into_result(
-        None, "https://x.example/", "default", result,
+        None, "https://ctf.corp.local/", "default", result,
     ))
     assert out is result
     assert result.pulled_sessions == 0

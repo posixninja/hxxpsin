@@ -55,7 +55,7 @@ def patch_httpx(monkeypatch):
     yield
 
 
-def _drive(responder, target="https://t.example/", extra_bases=None):
+def _drive(responder, target="https://ctf.corp.local/", extra_bases=None):
     """Set the stub responder, run a fresh probe, and return the result."""
     _StubAsyncClient.responder = staticmethod(responder)
     probe = scm_probe.SCMProbe(out_dir="")
@@ -84,30 +84,30 @@ def test_catalog_severities_set_for_critical_leaks():
 # ── Base normalization ──────────────────────────────────────────────────────
 
 def test_normalize_bases_root_only():
-    bases = scm_probe.SCMProbe._normalize_bases("https://t.example/", [])
-    assert bases == ["https://t.example/"]
+    bases = scm_probe.SCMProbe._normalize_bases("https://ctf.corp.local/", [])
+    assert bases == ["https://ctf.corp.local/"]
 
 
 def test_normalize_bases_includes_subdirectories():
     bases = scm_probe.SCMProbe._normalize_bases(
-        "https://t.example/",
+        "https://ctf.corp.local/",
         ["/admin/", "/api/", "/static/"],
     )
-    assert "https://t.example/admin/" in bases
-    assert "https://t.example/api/" in bases
+    assert "https://ctf.corp.local/admin/" in bases
+    assert "https://ctf.corp.local/api/" in bases
 
 
 def test_normalize_bases_strips_filenames_to_directories():
     bases = scm_probe.SCMProbe._normalize_bases(
-        "https://t.example/",
+        "https://ctf.corp.local/",
         ["/admin/index.php"],
     )
-    assert "https://t.example/admin/" in bases
+    assert "https://ctf.corp.local/admin/" in bases
 
 
 def test_normalize_bases_rejects_cross_origin():
     bases = scm_probe.SCMProbe._normalize_bases(
-        "https://t.example/",
+        "https://ctf.corp.local/",
         ["https://attacker.example/admin/"],
     )
     assert "https://attacker.example/admin/" not in bases
@@ -115,7 +115,7 @@ def test_normalize_bases_rejects_cross_origin():
 
 def test_normalize_bases_caps_at_max():
     extras = [f"/dir{i}/" for i in range(20)]
-    bases = scm_probe.SCMProbe._normalize_bases("https://t.example/", extras)
+    bases = scm_probe.SCMProbe._normalize_bases("https://ctf.corp.local/", extras)
     assert len(bases) <= 1 + scm_probe.SCMProbe._MAX_BASES
 
 
@@ -205,7 +205,7 @@ def test_probe_with_subdirectory_base():
     def responder(url):
         if "soft404" in url:
             return _StubResponse(404, b"")
-        if url == "https://t.example/admin/.env":
+        if url == "https://ctf.corp.local/admin/.env":
             return _StubResponse(200, b"DB_PASSWORD=root\n")
         return _StubResponse(404, b"")
 

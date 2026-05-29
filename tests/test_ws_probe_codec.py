@@ -57,7 +57,7 @@ def test_scan_finds_jwt_in_sent_frame():
     token = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9."
     sent = [{"raw": json.dumps({"type": "auth", "token": token})}]
     findings = ws_probe._scan_frames_for_encoded_payloads(
-        "wss://example.com/ws", sent, [],
+        "wss://corp.local/ws", sent, [],
     )
     assert findings, "expected JWT to be surfaced from sent frame"
     f = findings[0]
@@ -67,13 +67,13 @@ def test_scan_finds_jwt_in_sent_frame():
 
 
 def test_scan_finds_base64_url_in_received_frame():
-    encoded_url = _b64("https://internal-api.example/admin-panel")
+    encoded_url = _b64("https://internal-api.corp.local/admin-panel")
     received = [{"raw": json.dumps({"redirect": encoded_url})}]
     findings = ws_probe._scan_frames_for_encoded_payloads(
-        "wss://example.com/ws", [], received,
+        "wss://corp.local/ws", [], received,
     )
     assert findings
-    assert any("internal-api.example" in f["evidence"] for f in findings)
+    assert any("internal-api.corp.local" in f["evidence"] for f in findings)
     assert any(f["severity"] in ("medium", "high") for f in findings)
 
 
@@ -81,17 +81,17 @@ def test_scan_ignores_short_garbage():
     # Frames too short to be encoded payloads should not produce findings
     sent = [{"raw": "ping"}, {"raw": "ack"}, {"raw": "{}"}]
     findings = ws_probe._scan_frames_for_encoded_payloads(
-        "wss://example.com/ws", sent, [],
+        "wss://corp.local/ws", sent, [],
     )
     assert findings == []
 
 
 def test_scan_dedupes_same_decoded_value():
-    encoded_url = _b64("https://api.example/secret")
+    encoded_url = _b64("https://api.corp.local/secret")
     # Same encoded value appears in multiple frames
     frames = [{"raw": json.dumps({"x": encoded_url})} for _ in range(4)]
     findings = ws_probe._scan_frames_for_encoded_payloads(
-        "wss://example.com/ws", frames, [],
+        "wss://corp.local/ws", frames, [],
     )
     # Should produce at most ONE finding for the same (direction, scheme,
     # decoded_prefix) combination
@@ -102,7 +102,7 @@ def test_scan_severity_high_for_secret_keywords():
     encoded = _b64('{"api_key":"sk_live_real_key"}')
     sent = [{"raw": json.dumps({"payload": encoded})}]
     findings = ws_probe._scan_frames_for_encoded_payloads(
-        "wss://example.com/ws", sent, [],
+        "wss://corp.local/ws", sent, [],
     )
     assert findings
     assert any(f["severity"] == "high" for f in findings), \
@@ -114,6 +114,6 @@ def test_scan_skips_routine_url_encoding():
     # payload — passive scan should stay quiet
     sent = [{"raw": "%E4%B8%AD%E6%96%87"}]  # URL-encoded "中文"
     findings = ws_probe._scan_frames_for_encoded_payloads(
-        "wss://example.com/ws", sent, [],
+        "wss://corp.local/ws", sent, [],
     )
     assert findings == []

@@ -61,7 +61,7 @@ def patch_httpx(monkeypatch):
     yield
 
 
-def _drive(responder, target="https://acme.example.com/",
+def _drive(responder, target="https://ctf.corp.local/",
            subdomains=None, credential_corpus=None):
     _StubAsyncClient.responder = staticmethod(responder)
     probe = cloud_probe.CloudProbe(out_dir="")
@@ -73,12 +73,12 @@ def _drive(responder, target="https://acme.example.com/",
 
 def test_company_from_host_strips_subdomain_and_www():
     assert cloud_probe.CloudProbe._company_from_host("www.juice-shop.com") == "juice-shop"
-    assert cloud_probe.CloudProbe._company_from_host("api.acme.com") == "acme"
+    assert cloud_probe.CloudProbe._company_from_host("api.corp.local") == "corp"
     assert cloud_probe.CloudProbe._company_from_host("localhost") == ""
 
 
 def test_bucket_candidates_includes_all_providers():
-    cands = cloud_probe.CloudProbe._bucket_candidates("acme")
+    cands = cloud_probe.CloudProbe._bucket_candidates("corp")
     providers = {p for p, _ in cands}
     for required in ("aws_s3", "gcp_gcs", "azure_blob",
                       "cloudflare_r2", "digitalocean"):
@@ -86,11 +86,11 @@ def test_bucket_candidates_includes_all_providers():
 
 
 def test_bucket_candidates_uses_suffix_set():
-    cands = cloud_probe.CloudProbe._bucket_candidates("acme")
+    cands = cloud_probe.CloudProbe._bucket_candidates("corp")
     urls = [u for _, u in cands]
     # Suffix variants should appear
-    assert any("acme-prod" in u for u in urls)
-    assert any("acme-backup" in u for u in urls)
+    assert any("corp-prod" in u for u in urls)
+    assert any("corp-backup" in u for u in urls)
 
 
 def test_provider_for_secret_routing():
@@ -123,23 +123,23 @@ def test_classify_azure_functions():
 
 
 def test_classify_non_function_returns_none():
-    assert cloud_probe.CloudProbe._classify_function_host("acme.com") is None
+    assert cloud_probe.CloudProbe._classify_function_host("ctf.corp.local") is None
 
 
 # ── Bucket probe ────────────────────────────────────────────────────────────
 
 def test_bucket_listing_critical_when_xml_returned():
     def responder(url):
-        if "acme.s3.amazonaws.com" in url:
+        if "corp.s3.amazonaws.com" in url:
             return _StubResponse(200,
-                "<?xml version='1.0'?><ListBucketResult><Name>acme</Name></ListBucketResult>"
+                "<?xml version='1.0'?><ListBucketResult><Name>corp</Name></ListBucketResult>"
             )
         return _StubResponse(404, "")
-    result = _drive(responder, target="https://acme.com/")
+    result = _drive(responder, target="https://ctf.corp.local/")
     buckets = [f for f in result.findings
                 if f.surface == "bucket_exposure" and f.severity == "critical"]
     assert buckets, f"expected critical bucket finding, got {[f.surface for f in result.findings]}"
-    assert "acme" in buckets[0].url
+    assert "corp" in buckets[0].url
 
 
 def test_bucket_listing_json_format_also_confirmed():
@@ -157,11 +157,11 @@ def test_bucket_listing_json_format_also_confirmed():
 
 def test_bucket_403_access_denied_yields_info():
     def responder(url):
-        if "acme.s3.amazonaws.com" in url:
+        if "corp.s3.amazonaws.com" in url:
             return _StubResponse(403,
                 "<Error><Code>AccessDenied</Code></Error>")
         return _StubResponse(404, "")
-    result = _drive(responder, target="https://acme.com/")
+    result = _drive(responder, target="https://ctf.corp.local/")
     info = [f for f in result.findings
              if f.surface == "bucket_exposure" and f.severity == "info"]
     assert info
@@ -171,8 +171,8 @@ def test_bucket_403_access_denied_yields_info():
 
 def test_oidc_config_flags_none_auth_method():
     cfg = {
-        "issuer": "https://acme.example.com",
-        "jwks_uri": "https://acme.example.com/jwks",
+        "issuer": "https://ctf.corp.local",
+        "jwks_uri": "https://ctf.corp.local/jwks",
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "none"],
         "response_types_supported": ["code"],
     }
@@ -192,7 +192,7 @@ def test_oidc_config_flags_none_auth_method():
 
 def test_oidc_config_flags_implicit_flow():
     cfg = {
-        "issuer": "https://acme.example.com",
+        "issuer": "https://ctf.corp.local",
         "response_types_supported": ["code", "token", "id_token"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic"],
     }
@@ -217,12 +217,12 @@ def test_oidc_config_absent_no_findings():
 
 def test_dangling_cname_s3_takeover():
     def responder(url):
-        if "subdomain.acme.example.com" in url:
+        if "subdomain.ctf.corp.local" in url:
             return _StubResponse(404,
                 "<Error><Code>NoSuchBucket</Code></Error>"
             )
         return _StubResponse(404, "")
-    result = _drive(responder, subdomains=["subdomain.acme.example.com"])
+    result = _drive(responder, subdomains=["subdomain.ctf.corp.local"])
     takeover = [f for f in result.findings if f.surface == "dangling_cname"]
     assert takeover and takeover[0].provider == "aws_s3"
     assert takeover[0].severity == "critical"
@@ -230,10 +230,10 @@ def test_dangling_cname_s3_takeover():
 
 def test_dangling_cname_heroku_unclaimed():
     def responder(url):
-        if "abandoned.acme.example.com" in url:
+        if "abandoned.ctf.corp.local" in url:
             return _StubResponse(404, "There's nothing here yet.")
         return _StubResponse(404, "")
-    result = _drive(responder, subdomains=["abandoned.acme.example.com"])
+    result = _drive(responder, subdomains=["abandoned.ctf.corp.local"])
     heroku = [f for f in result.findings if f.provider == "heroku"]
     assert heroku
 
@@ -241,7 +241,7 @@ def test_dangling_cname_heroku_unclaimed():
 def test_dangling_cname_clean_returns_no_finding():
     def responder(url):
         return _StubResponse(200, "<html>welcome</html>")
-    result = _drive(responder, subdomains=["live.acme.example.com"])
+    result = _drive(responder, subdomains=["live.ctf.corp.local"])
     assert not any(f.surface == "dangling_cname" for f in result.findings)
 
 

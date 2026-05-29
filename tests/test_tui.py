@@ -287,7 +287,7 @@ class TestManualMode:
             # Simulate the wizard returning a manual config
             cfg = {
                 "mode": "manual",
-                "target": "https://example.com",
+                "target": "https://ctf.corp.local",
                 "out": "output/test",
                 "auth": None,
                 "active_scan": False,
@@ -313,7 +313,7 @@ class TestManualMode:
         async with app.run_test(headless=True, size=(200, 50)) as pilot:
             await pilot.pause()
             app._state.session_config = {
-                "target": "https://example.com",
+                "target": "https://ctf.corp.local",
                 "out": "output/test",
             }
             calls: list = []
@@ -344,7 +344,7 @@ class TestWizardPassive:
             wiz = WizardScreen()
             await app.push_screen(wiz, _capture)
             await pilot.pause()
-            wiz.query_one("#inp-target", Input).value = "https://example.com"
+            wiz.query_one("#inp-target", Input).value = "https://ctf.corp.local"
             await pilot.pause()
             wiz._do_start()
             await pilot.pause()
@@ -841,36 +841,36 @@ class TestAlertsBar:
 
 class TestEntityTree:
     def test_parse_links_from_html(self):
-        e = _EntityExtractor("https://example.com/")
+        e = _EntityExtractor("https://ctf.corp.local/")
         e.feed('<a href="/page1">link</a><a href="#skip">anchor</a><a href="javascript:void(0)">js</a>')
-        assert "https://example.com/page1" in e.links
+        assert "https://ctf.corp.local/page1" in e.links
         assert len(e.links) == 1  # anchors and js: skipped
 
     def test_parse_images(self):
-        e = _EntityExtractor("https://example.com/")
+        e = _EntityExtractor("https://ctf.corp.local/")
         e.feed('<img src="/logo.png"><source src="/vid.mp4">')
-        assert "https://example.com/logo.png" in e.images
-        assert "https://example.com/vid.mp4" in e.images
+        assert "https://ctf.corp.local/logo.png" in e.images
+        assert "https://ctf.corp.local/vid.mp4" in e.images
 
     def test_parse_form_fields(self):
-        e = _EntityExtractor("https://example.com/")
+        e = _EntityExtractor("https://ctf.corp.local/")
         e.feed('<form action="/login" method="POST"><input name="user"><input name="pass" type="password"></form>')
         assert len(e.forms) == 1
         assert e.forms[0]["method"] == "POST"
-        assert e.forms[0]["action"] == "https://example.com/login"
+        assert e.forms[0]["action"] == "https://ctf.corp.local/login"
         field_names = [f["name"] for f in e.forms[0]["fields"]]
         assert "user" in field_names
         assert "pass" in field_names
 
     def test_parse_external_script(self):
-        e = _EntityExtractor("https://example.com/")
+        e = _EntityExtractor("https://ctf.corp.local/")
         e.feed('<script src="/app.js"></script>')
-        assert any(s.get("src") == "https://example.com/app.js" for s in e.scripts)
+        assert any(s.get("src") == "https://ctf.corp.local/app.js" for s in e.scripts)
 
     def test_parse_inline_ws(self):
-        e = _EntityExtractor("https://example.com/")
-        e.feed('<script>var ws = new WebSocket("wss://example.com/ws");</script>')
-        assert "wss://example.com/ws" in e.websockets
+        e = _EntityExtractor("https://ctf.corp.local/")
+        e.feed('<script>var ws = new WebSocket("wss://ctf.corp.local/ws");</script>')
+        assert "wss://ctf.corp.local/ws" in e.websockets
 
     def test_entity_tree_loads_params_from_url(self):
         import asyncio

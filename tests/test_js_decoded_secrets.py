@@ -21,11 +21,11 @@ def _b64(s: str) -> str:
 
 
 def test_decodes_base64_url_constant():
-    encoded = _b64("https://internal-api.example.com/v1/admin")
+    encoded = _b64("https://internal-api.corp.local/v1/admin")
     content = f'''const CFG = {{ endpoint: "{encoded}" }};'''
     out = jda._extract_decoded_secrets(content, "app.js")
     assert out, f"expected a decoded secret from {encoded!r}, got nothing"
-    assert any("internal-api.example.com" in d.decoded for d in out)
+    assert any("internal-api.corp.local" in d.decoded for d in out)
     assert any(d.hint == "URL" for d in out)
 
 
@@ -61,7 +61,7 @@ def test_classify_decoded_high_for_secret_keywords():
 
 
 def test_decoded_secrets_appear_in_result_to_dict():
-    encoded = _b64("https://hidden.api.example/secret-endpoint")
+    encoded = _b64("https://hidden.api.corp.local/secret-endpoint")
     content = f'const X = "{encoded}";'
     result = jda.JSAnalysisResult()
     result.decoded_secrets.extend(jda._extract_decoded_secrets(content, "x.js"))
@@ -72,7 +72,7 @@ def test_decoded_secrets_appear_in_result_to_dict():
 
 
 def test_dedup_collapses_same_literal_across_files():
-    encoded = _b64("https://shared.api.example/v1/users")
+    encoded = _b64("https://shared.api.corp.local/v1/users")
     content = f'const X = "{encoded}";'
     result = jda.JSAnalysisResult()
     result.decoded_secrets.extend(jda._extract_decoded_secrets(content, "a.js"))

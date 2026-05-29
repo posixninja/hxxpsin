@@ -21,7 +21,7 @@ def _b64(s: str) -> str:
 
 def test_encoded_id_segments_finds_base64_user_id():
     seg = _b64("user42")
-    url = f"https://api.example.com/users/{seg}/profile"
+    url = f"http://localhost:5050/users/{seg}/profile"
     out = idor_probe._encoded_id_segments(url)
     assert out, f"expected encoded segment from {seg!r} in {url!r}"
     original, scheme, decoded = out[0]
@@ -32,15 +32,15 @@ def test_encoded_id_segments_finds_base64_user_id():
 
 def test_encoded_id_segments_skips_numeric_and_uuid():
     # Plain numeric IDs and UUIDs are handled by the existing passes
-    url1 = "https://api.example.com/users/42/profile"
-    url2 = "https://api.example.com/users/550e8400-e29b-41d4-a716-446655440000/profile"
+    url1 = "http://localhost:5050/users/42/profile"
+    url2 = "http://localhost:5050/users/550e8400-e29b-41d4-a716-446655440000/profile"
     assert idor_probe._encoded_id_segments(url1) == []
     assert idor_probe._encoded_id_segments(url2) == []
 
 
 def test_encoded_id_segments_skips_minified_garbage():
     # Short random-looking segments should not be flagged as encoded IDs
-    url = "https://api.example.com/v1/abc/def"
+    url = "http://localhost:5050/v1/abc/def"
     out = idor_probe._encoded_id_segments(url)
     assert out == []
 
@@ -72,7 +72,7 @@ def test_end_to_end_encode_mutate_decode():
     # Build a URL with base64 user id → run the segment scanner → mutate →
     # re-encode → verify the result is decodable back to the mutated value
     seg = _b64("user42")
-    url = f"https://api.example.com/users/{seg}/profile"
+    url = f"http://localhost:5050/users/{seg}/profile"
 
     found = idor_probe._encoded_id_segments(url)
     assert found

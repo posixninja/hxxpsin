@@ -179,14 +179,14 @@ def test_augment_dedupes_hosts():
     with source = msf:<workspace>."""
     from surface_mapper import HostRecord, Scope
 
-    scope = Scope(seed="https://example.com")
-    scope.hosts.append(HostRecord(hostname="api.example.com",
+    scope = Scope(seed="https://corp.local")
+    scope.hosts.append(HostRecord(hostname="api.corp.local",
                                   addresses=["192.0.2.5"], source="seed"))
 
     fake = FakeClient(
         hosts=[
-            MSFHost(address="192.0.2.5", hostname="api.example.com"),  # overlap
-            MSFHost(address="10.0.0.7", hostname="db.example.com"),    # new
+            MSFHost(address="192.0.2.5", hostname="api.corp.local"),  # overlap
+            MSFHost(address="10.0.0.7", hostname="db.corp.local"),    # new
         ],
         services=[
             MSFService(host="10.0.0.7", port=5432, proto="tcp", name="postgres"),
@@ -198,9 +198,9 @@ def test_augment_dedupes_hosts():
     assert res.pulled_hosts == 2
     assert res.pulled_services == 2
     assert len(scope.hosts) == 2  # one existing + one new (overlap skipped)
-    assert res.overlapped_hosts == ["api.example.com"]
+    assert res.overlapped_hosts == ["api.corp.local"]
 
-    new = [h for h in scope.hosts if h.hostname == "db.example.com"]
+    new = [h for h in scope.hosts if h.hostname == "db.corp.local"]
     assert len(new) == 1
     assert new[0].source == "msf:default"
     assert 22 in new[0].open_ports and 5432 in new[0].open_ports
@@ -233,10 +233,10 @@ def test_push_idempotent(tmp_path):
     only on the first call; the sidecar gates the second run."""
     fake = FakeClient(workspace="default")
     findings = [
-        _Finding(url="https://target.com/api/users/1", score=80, categories=["IDOR"]),
+        _Finding(url="https://ctf.corp.local/api/users/1", score=80, categories=["IDOR"]),
     ]
     res1 = asyncio.run(push_findings(
-        fake, "https://target.com", findings, tmp_path, min_score=50,
+        fake, "https://ctf.corp.local", findings, tmp_path, min_score=50,
     ))
     assert len(res1.pushed_vulns) == 1
     sidecar = tmp_path / "msf_pushed.json"
@@ -245,7 +245,7 @@ def test_push_idempotent(tmp_path):
     assert len(first_payload) == 1
 
     res2 = asyncio.run(push_findings(
-        fake, "https://target.com", findings, tmp_path, min_score=50,
+        fake, "https://ctf.corp.local", findings, tmp_path, min_score=50,
     ))
     assert len(res2.pushed_vulns) == 0  # second call skipped the cached entry
     # Sidecar must be unchanged
@@ -258,22 +258,22 @@ def test_push_min_score_gates(tmp_path):
     """Findings below push_min_score are silently skipped."""
     fake = FakeClient(workspace="default")
     findings = [
-        _Finding(url="https://target.com/low",  score=30, categories=["INFO"]),
-        _Finding(url="https://target.com/high", score=80, categories=["IDOR"]),
+        _Finding(url="https://ctf.corp.local/low",  score=30, categories=["INFO"]),
+        _Finding(url="https://ctf.corp.local/high", score=80, categories=["IDOR"]),
     ]
     res = asyncio.run(push_findings(
-        fake, "https://target.com", findings, tmp_path, min_score=50,
+        fake, "https://ctf.corp.local", findings, tmp_path, min_score=50,
     ))
     assert len(res.pushed_vulns) == 1
     assert len(fake.pushed) == 1
-    assert fake.pushed[0]["info"].startswith("GET https://target.com/high")
+    assert fake.pushed[0]["info"].startswith("GET https://ctf.corp.local/high")
 
 
 def test_augment_handles_no_client_gracefully():
     """augment_scope_from_msf with client=None returns an empty result and
     leaves the Scope untouched."""
     from surface_mapper import Scope
-    scope = Scope(seed="https://example.com")
+    scope = Scope(seed="https://corp.local")
     res = asyncio.run(augment_scope_from_msf(scope, None, "default"))
     assert res.backend == ""
     assert res.pulled_hosts == 0
@@ -305,25 +305,25 @@ def test_sidecar_unprefixed_keys_auto_promote_to_vuln_namespace(tmp_path):
     re-written in the new prefixed form on the next push."""
     sidecar = tmp_path / "msf_pushed.json"
     # Simulate a round-1 sidecar with an unprefixed entry already present.
-    legacy_key = "IDOR|https://target.com/api/users/1"
+    legacy_key = "IDOR|https://ctf.corp.local/api/users/1"
     sidecar.write_text(json.dumps({legacy_key: "v999"}))
 
     fake = FakeClient(workspace="default")
     findings = [
-        _Finding(url="https://target.com/api/users/1", score=80, categories=["IDOR"]),
-        _Finding(url="https://target.com/api/users/2", score=80, categories=["IDOR"]),
+        _Finding(url="https://ctf.corp.local/api/users/1", score=80, categories=["IDOR"]),
+        _Finding(url="https://ctf.corp.local/api/users/2", score=80, categories=["IDOR"]),
     ]
     res = asyncio.run(push_findings(
-        fake, "https://target.com", findings, tmp_path, min_score=50,
+        fake, "https://ctf.corp.local", findings, tmp_path, min_score=50,
     ))
     # The legacy entry must dedupe the first finding; only the second is pushed.
     assert len(res.pushed_vulns) == 1
     assert len(fake.pushed) == 1
-    assert fake.pushed[0]["info"].startswith("GET https://target.com/api/users/2")
+    assert fake.pushed[0]["info"].startswith("GET https://ctf.corp.local/api/users/2")
 
     # Sidecar must now hold both entries under the `vuln:` namespace.
     payload = json.loads(sidecar.read_text())
-    assert "vuln:IDOR|https://target.com/api/users/1" in payload
-    assert "vuln:IDOR|https://target.com/api/users/2" in payload
+    assert "vuln:IDOR|https://ctf.corp.local/api/users/1" in payload
+    assert "vuln:IDOR|https://ctf.corp.local/api/users/2" in payload
     # Legacy unprefixed key is gone (auto-promoted).
     assert legacy_key not in payload

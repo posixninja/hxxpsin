@@ -21,7 +21,7 @@ import recon_collector as rc  # noqa: E402
 
 def _finding():
     return Finding(method="GET",
-                   url="https://api.example.com/login?redirect=/dashboard",
+                   url="https://ctf.corp.local/login?redirect=/dashboard",
                    score=10, categories=[Cat.REDIRECT], evidence=[])
 
 
@@ -93,7 +93,7 @@ def test_crlf_set_cookie_includes_token():
 
 
 def test_no_target_param_returns_empty():
-    f = Finding(method="GET", url="https://api.example.com/no/param/here",
+    f = Finding(method="GET", url="https://ctf.corp.local/no/param/here",
                 score=5, categories=[Cat.REDIRECT], evidence=[])
     ctx = rc.ReconContext(public_url="https://abc.trycloudflare.com")
     probes = rc.OpenRedirectRecipe().probes_with_ctx(f, ctx)
@@ -122,7 +122,7 @@ def test_other_recipes_unaffected_by_ctx():
     # SSRFRecipe does NOT define probes_with_ctx — it should still work via
     # the plain probes(finding) path even when ctx is passed.
     f = Finding(method="GET",
-                url="https://api.example.com/fetch?url=https://orig.example/",
+                url="https://ctf.corp.local/fetch?url=https://origin.corp.local/",
                 score=10, categories=[Cat.SSRF], evidence=[])
     ctx = rc.ReconContext(public_url="https://abc.trycloudflare.com")
     probes = rc._recipe_probes(rc.SSRFRecipe(), f, ctx)

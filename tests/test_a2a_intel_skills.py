@@ -84,7 +84,7 @@ async def test_intel_msf_returns_disabled_error_when_unconfigured(client, tmp_pa
         "/",
         json=_submit(
             "intel_msf",
-            {"target": "http://example.com", "action": "ping", "config_path": str(cfg_path)},
+            {"target": "http://ctf.corp.local", "action": "ping", "config_path": str(cfg_path)},
         ),
     )
     rec = await _wait_terminal(client, (await resp.json())["result"]["id"])

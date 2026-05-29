@@ -11,8 +11,8 @@ from http_cache import HttpCache, HttpGovernorConfig, ScopeGuard
 
 
 def test_scope_guard_allows_target_host():
-    g = ScopeGuard("https://app.example.com", HttpGovernorConfig())
-    assert g.allowed("https://app.example.com/api/users")
+    g = ScopeGuard("https://ctf.corp.local", HttpGovernorConfig())
+    assert g.allowed("https://ctf.corp.local/api/users")
     assert not g.allowed("https://evil.com/")
 
 

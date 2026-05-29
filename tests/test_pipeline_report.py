@@ -19,10 +19,10 @@ async def test_write_pipeline_report_minimal(tmp_path):
     import main as m
 
     class Args:
-        target = "https://example.com"
+        target = "https://ctf.corp.local"
         timeout = 5.0
 
-    finding = Finding("GET", "https://example.com/", 50, ["Injection"], [])
+    finding = Finding("GET", "https://ctf.corp.local/", 50, ["Injection"], [])
     result = ClassifierResult(
         request_findings=[finding],
         websocket_findings=[],
@@ -30,8 +30,8 @@ async def test_write_pipeline_report_minimal(tmp_path):
         js_constants=[],
         by_category={},
     )
-    col = Collector(origin="https://example.com")
-    profile = StackProfile(target="https://example.com", detected={})
+    col = Collector(origin="https://ctf.corp.local")
+    profile = StackProfile(target="https://ctf.corp.local", detected={})
 
     ps = PipelineState(
         args=Args(),

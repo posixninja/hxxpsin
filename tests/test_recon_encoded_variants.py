@@ -23,7 +23,7 @@ def _finding(url, categories, *, method="GET", body=None):
 
 
 def test_ssrf_recipe_emits_double_encoded_variant():
-    f = _finding("https://api.example.com/fetch?url=https://orig.example/",
+    f = _finding("https://ctf.corp.local/fetch?url=https://origin.corp.local/",
                  [Cat.SSRF])
     probes = rc.SSRFRecipe().probes(f)
     labels = [p.label for p in probes]
@@ -40,7 +40,7 @@ def test_ssrf_recipe_emits_double_encoded_variant():
 
 
 def test_injection_recipe_emits_double_encoded_variants():
-    f = _finding("https://api.example.com/search?q=hello", [Cat.INJECTION])
+    f = _finding("https://ctf.corp.local/search?q=hello", [Cat.INJECTION])
     probes = rc.InjectionRecipe().probes(f)
     labels = [p.label for p in probes]
     # Each base injection payload should have an _urlx2 sibling
@@ -51,7 +51,7 @@ def test_injection_recipe_emits_double_encoded_variants():
 
 
 def test_open_redirect_recipe_emits_double_encoded_variant():
-    f = _finding("https://api.example.com/login?redirect=/dashboard",
+    f = _finding("https://ctf.corp.local/login?redirect=/dashboard",
                  [Cat.REDIRECT])
     probes = rc.OpenRedirectRecipe().probes(f)
     labels = [p.label for p in probes]
@@ -63,8 +63,8 @@ def test_ssrf_recipe_body_location_unchanged():
     # When the SSRF param is in the JSON body (not query string), we should
     # NOT emit double-encoded variants — that breaks JSON formatting and
     # wasn't the bypass we were targeting.
-    body = '{"url": "https://orig.example/"}'
-    f = _finding("https://api.example.com/webhook", [Cat.SSRF],
+    body = '{"url": "https://origin.corp.local/"}'
+    f = _finding("https://ctf.corp.local/webhook", [Cat.SSRF],
                  method="POST", body=body)
     probes = rc.SSRFRecipe().probes(f)
     labels = [p.label for p in probes]

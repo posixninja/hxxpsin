@@ -21,13 +21,13 @@ import open_redirect as orr  # noqa: E402
 
 def _mk_target() -> orr._Target:
     finding = SimpleNamespace(
-        url="https://target.example/redir",
+        url="https://ctf.corp.local/redir",
         method="GET",
         body=None,
         headers={},
     )
     return orr._Target(
-        url="https://target.example/redir",
+        url="https://ctf.corp.local/redir",
         method="GET",
         surface="query",
         param="next",
@@ -94,7 +94,7 @@ def test_check_response_likely_when_alt_scheme_unrelated_to_payload():
     not confirmed."""
     t = _mk_target()
     payload = "ftp://attacker/"
-    r = _mk_response(location="mailto:admin@target.example")
+    r = _mk_response(location="mailto:admin@ctf.corp.local")
     # mailto isn't in our alt list, so it won't match — sanity check.
     assert orr._check_response(t, payload, "alt-ftp", r) is None
     # gopher (which IS in the alt list) but with a server-side host unrelated
