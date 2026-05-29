@@ -111,6 +111,7 @@ class DesyncProbe:
         profile=None,           # Optional[StackProfile] — for protocol probe
         max_urls: int = 20,
         timeout: float = 6.0,
+        confirm_smuggling: bool = False,
     ):
         # Deduplicate and cap; prioritize GET endpoints
         seen: set[str] = set()
@@ -124,6 +125,7 @@ class DesyncProbe:
 
         self.profile = profile
         self.timeout = timeout
+        self.confirm_smuggling = confirm_smuggling
 
     async def run(self) -> DesyncResult:
         findings: list[DesyncFinding] = []
@@ -144,8 +146,65 @@ class DesyncProbe:
                 if isinstance(r, list):
                     findings.extend(r)
 
+        if self.confirm_smuggling and self.urls:
+            findings.extend(await self._probe_smuggling_differential(self.urls[0]))
+
         findings.sort(key=lambda f: _SEV_ORDER.get(f.severity, 4))
         return DesyncResult(findings=findings, urls_probed=len(self.urls))
+
+    async def _probe_smuggling_differential(self, url: str) -> list[DesyncFinding]:
+        """Safe bounded CL.TE / TE.CL differential — one malformed request per type.
+
+        Does not send full smuggle bodies; only checks whether the server returns
+        a distinct error signature vs a normal GET baseline.
+        """
+        out: list[DesyncFinding] = []
+        parsed = urlparse(url)
+        host = parsed.hostname or "localhost"
+        path = parsed.path or "/"
+
+        async with httpx.AsyncClient(
+            verify=False, timeout=self.timeout, follow_redirects=False,
+        ) as client:
+            try:
+                baseline = await client.get(url, headers=_HEADERS)
+                b_sig = (baseline.status_code, baseline.headers.get("server", ""))
+            except Exception:
+                return out
+
+            try:
+                # Raw socket would be ideal; httpx may normalize — still useful as signal
+                r = await client.post(
+                    url,
+                    headers={**_HEADERS, "Content-Length": "6", "Transfer-Encoding": "chunked"},
+                    content=b"0\r\n\r\nG",
+                )
+                if (r.status_code, r.headers.get("server", "")) != b_sig and r.status_code in (400, 501, 502):
+                    out.append(DesyncFinding(
+                        url=url, probe="smuggling", risk="cl_te_differential",
+                        severity="medium",
+                        signals=[f"CL.TE probe returned {r.status_code} vs baseline {baseline.status_code}"],
+                        manual_tests=["Confirm with Burp HTTP Request Smuggler CL.TE"],
+                    ))
+            except Exception:
+                pass
+
+            try:
+                r2 = await client.post(
+                    url,
+                    headers={**_HEADERS, "Transfer-Encoding": "chunked, identity"},
+                    content=b"0\r\n\r\n",
+                )
+                if r2.status_code in (400, 501, 502) and r2.status_code != baseline.status_code:
+                    out.append(DesyncFinding(
+                        url=url, probe="smuggling", risk="te_cl_differential",
+                        severity="medium",
+                        signals=[f"TE.CL probe returned {r2.status_code}"],
+                        manual_tests=["Confirm with Burp HTTP Request Smuggler TE.CL"],
+                    ))
+            except Exception:
+                pass
+        return out
 
     async def _probe_url(self, url: str, client: httpx.AsyncClient) -> list[DesyncFinding]:
         out: list[DesyncFinding] = []

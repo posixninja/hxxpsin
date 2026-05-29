@@ -26,6 +26,11 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass, field
+
+try:
+    from confidence import from_verifier_verdict, promote_verdict
+except ImportError:
+    from_verifier_verdict = promote_verdict = None  # type: ignore
 from typing import Optional
 from urllib.parse import urlencode, urlparse, parse_qs, urljoin
 
@@ -255,17 +260,22 @@ class Verifier:
         origin: str = "",
         max_findings: int = 40,
         canary=None,     # Optional[Canary] from canary.py — enables OOB SSRF detection
+        http_cache=None,  # Optional[HttpCache] — shared probe HTTP layer
     ):
         self.findings = findings[:max_findings]
         self.auth_headers = auth_headers or {}
         self.timeout = timeout
         self.origin = origin
         self.canary = canary
+        self.http_cache = http_cache
         # Soft-404 baseline, set by _calibrate() before the run
         self._soft404: Optional[tuple[int, str, int]] = None  # (status, location, body_len)
 
     async def run(self) -> VerifyReport:
-        async with httpx.AsyncClient(
+        from probe_http import open_probe_client
+
+        async with open_probe_client(
+            self.http_cache,
             verify=False,
             timeout=self.timeout,
             follow_redirects=True,
@@ -553,6 +563,7 @@ class Verifier:
                     finding,
                     f"SSRF confirmed via OOB callback ({hits[0].protocol}) from {hits[0].remote_address}",
                     None, url,
+                    oob_hit=True,
                 )
 
         return self._not_confirmed(finding, "internal and external URL probes returned similar responses", None)
@@ -986,21 +997,30 @@ class Verifier:
         except Exception:
             return ""
 
-    def _make(self, finding, verdict, confidence, evidence, resp, probe_url) -> VerifyResult:
+    def _make(
+        self, finding, verdict, confidence, evidence, resp, probe_url,
+        *, oob_hit: bool = False,
+    ) -> VerifyResult:
+        if from_verifier_verdict is not None:
+            label = from_verifier_verdict(verdict, confidence)
+            if promote_verdict is not None:
+                label = promote_verdict(label, oob_hit=oob_hit)
+            verdict = label.verdict.value
+            confidence = label.confidence
         return VerifyResult(
             url=finding.url,
             method=finding.method,
             categories=finding.categories,
             verdict=verdict,
             confidence=confidence,
-            evidence=evidence,
+            evidence=evidence + (" [OOB correlated]" if oob_hit else ""),
             probe_url=probe_url or finding.url,
             response_snippet=self._resp_snippet(resp),
             status_code=resp.status_code if resp else 0,
         )
 
-    def _confirmed(self, f, evidence, resp, probe_url) -> VerifyResult:
-        return self._make(f, "confirmed", 0.9, evidence, resp, probe_url)
+    def _confirmed(self, f, evidence, resp, probe_url, *, oob_hit: bool = False) -> VerifyResult:
+        return self._make(f, "confirmed", 0.9, evidence, resp, probe_url, oob_hit=oob_hit)
 
     def _likely(self, f, evidence, resp, probe_url) -> VerifyResult:
         return self._make(f, "likely", 0.6, evidence, resp, probe_url)

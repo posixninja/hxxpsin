@@ -75,9 +75,11 @@ class CRLFProbe:
         self,
         auth_headers: Optional[dict] = None,
         timeout: float = 8.0,
+        http_cache=None,
     ):
         self.auth_headers = auth_headers or {}
         self.timeout = timeout
+        self.http_cache = http_cache
 
     async def run(self, urls: list[str]) -> CRLFResult:
         result = CRLFResult(urls_tested=len(urls))
@@ -86,9 +88,12 @@ class CRLFProbe:
 
         crlf_seqs = payloads.crlf_payloads()
 
-        async with httpx.AsyncClient(
+        from probe_http import open_probe_client
+
+        async with open_probe_client(
+            self.http_cache,
             verify=False,
-            follow_redirects=False,  # don't follow — check raw response headers
+            follow_redirects=False,
             timeout=self.timeout,
             headers=self.auth_headers,
         ) as client:

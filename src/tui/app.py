@@ -567,6 +567,15 @@ class HxxpsinApp(App):
     def _on_pipeline_event(self, event: str, *args) -> None:
         self._state.on_pipeline_event(event, *args)
 
+        if event in ("stage_start", "stage_done", "stage_error"):
+            def _upd_stages() -> None:
+                try:
+                    probes = self.query_one("#screen-probes", ProbesScreen)
+                    probes.refresh_data()
+                except Exception:
+                    pass
+            self.call_from_thread(_upd_stages)
+
         if event == "step":
             n, total, label = args
             def _upd(n=n, total=total, label=label) -> None:

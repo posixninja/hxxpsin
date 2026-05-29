@@ -92,10 +92,12 @@ class NoSQLProbe:
         auth_headers: Optional[dict] = None,
         timeout: float = 10.0,
         timing_threshold: float = 3.0,
+        http_cache=None,
     ):
         self.auth_headers = auth_headers or {}
         self.timeout = timeout
         self.timing_threshold = timing_threshold
+        self.http_cache = http_cache
 
     async def run(self, findings, max_endpoints: int = 30) -> NoSQLResult:
         """findings: list[RequestFinding] from classifier.
@@ -135,9 +137,14 @@ class NoSQLProbe:
         if not targets:
             return result
 
-        async with httpx.AsyncClient(
-            verify=False, follow_redirects=True,
-            timeout=self.timeout, headers=self.auth_headers,
+        from probe_http import open_probe_client
+
+        async with open_probe_client(
+            self.http_cache,
+            verify=False,
+            follow_redirects=True,
+            timeout=self.timeout,
+            headers=self.auth_headers,
         ) as client:
             tasks = [self._probe_endpoint(client, f) for f in targets]
             all_findings = await asyncio.gather(*tasks, return_exceptions=True)

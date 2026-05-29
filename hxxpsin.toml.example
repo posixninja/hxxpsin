@@ -139,6 +139,15 @@ state_dir = "~/Desktop/Projects/servus/securisnexus/state"
 scope_prefix = "assistant:tool:hxxpsin"
 
 
+# ── HTTP governor (shared cache + rate limit + scope) ─────────────────────
+# All outbound probe traffic can share one polite httpx layer via _ScanContext.
+
+[http]
+max_concurrent = 12
+requests_per_second = 20.0
+# allow_hosts = ["target.example.com", "api.target.example.com"]
+# deny_paths = ["^/logout$", "^/admin/delete"]
+
 # ── A2A server bind ───────────────────────────────────────────────────────
 # Where the hxxpsin A2A HTTP server listens. Servus's A2A client hits the
 # same URL to discover skills and submit tasks.

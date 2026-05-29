@@ -153,6 +153,16 @@ class A2AProfile:
 
 
 @dataclass
+class HttpGovernorProfile:
+    """[http] block — shared cache, rate limit, scope guard for outbound probes."""
+
+    max_concurrent: int = 12
+    requests_per_second: float = 20.0
+    allow_hosts: list[str] = field(default_factory=list)
+    deny_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
 class TargetProfile:
     """Resolved per-target settings after hostname-suffix matching + mail-ref deref."""
     matched_key: Optional[str] = None
@@ -174,6 +184,7 @@ class Config:
     servus: ServusProfile = field(default_factory=ServusProfile)
     securisnexus: SecurisNexusProfile = field(default_factory=SecurisNexusProfile)
     a2a: A2AProfile = field(default_factory=A2AProfile)
+    http: HttpGovernorProfile = field(default_factory=HttpGovernorProfile)
     _targets: dict[str, dict] = field(default_factory=dict)
     sources: list[Path] = field(default_factory=list)
 
@@ -435,6 +446,16 @@ def load(
         port=int(os.environ.get("HXXPSIN_A2A_PORT") or a2a_raw.get("port") or 9851),
     )
 
+    http_raw = merged.get("http", {})
+    if not isinstance(http_raw, dict):
+        raise ConfigError("[http] must be a table")
+    http = HttpGovernorProfile(
+        max_concurrent=int(http_raw.get("max_concurrent", 12)),
+        requests_per_second=float(http_raw.get("requests_per_second", 20.0)),
+        allow_hosts=list(http_raw.get("allow_hosts") or []),
+        deny_paths=list(http_raw.get("deny_paths") or []),
+    )
+
     # ── [targets.*] blocks — kept raw, resolved per-call ────────────────
     targets_raw = merged.get("targets", {})
     if not isinstance(targets_raw, dict):
@@ -467,6 +488,7 @@ def load(
         servus=servus,
         securisnexus=securisnexus,
         a2a=a2a,
+        http=http,
         _targets=targets,
         sources=sources,
     )

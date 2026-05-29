@@ -71,6 +71,12 @@ class Reporter:
         tunnel_hits=None,   # Optional[list[Hit]] from payload_server
         tunnel_info=None,   # Optional[dict] — backend name + public URL
         msf_ingest=None,    # Optional[MSFIngestResult] from msf_ingest module
+        graphql_probe=None,
+        oauth_probe=None,
+        race_probe=None,
+        stage_timings=None,
+        stage_errors=None,
+        verify_report=None,
     ):
         self._result = result
         self._target = target
@@ -105,6 +111,12 @@ class Reporter:
         self._tunnel_hits = tunnel_hits or []
         self._tunnel_info = tunnel_info or {}
         self._msf_ingest = msf_ingest
+        self._graphql_probe = graphql_probe
+        self._oauth_probe = oauth_probe
+        self._race_probe = race_probe
+        self._stage_timings = stage_timings or []
+        self._stage_errors = stage_errors or []
+        self._verify_report = verify_report
 
     # ------------------------------------------------------------------
     # Public interface
@@ -118,7 +130,19 @@ class Reporter:
         json_path = d / "report.json"
 
         md_path.write_text(self.to_markdown())
-        json_path.write_text(json.dumps(self.to_dict(), indent=2))
+        report_dict = self.to_dict()
+        try:
+            from confidence import dedupe_evidence, evidence_from_verify_result
+            bundles = []
+            if self._verify_report is not None:
+                for r in getattr(self._verify_report, "results", []) or []:
+                    bundles.append(evidence_from_verify_result(r))
+            report_dict["deduped_evidence"] = [
+                b.to_dict() for b in dedupe_evidence(bundles)
+            ]
+        except Exception:
+            pass
+        json_path.write_text(json.dumps(report_dict, indent=2))
 
         # classify.json — lossless dump of every classifier finding (incl.
         # request headers + captured response). Consumed by the A2A
@@ -151,9 +175,20 @@ class Reporter:
     def to_markdown(self) -> str:
         sections: list[str] = []
         sections.append(self._section_header())
+        if self._stage_timings:
+            sections.append(self._section_stage_timings())
+        if self._stage_errors:
+            sections.append(self._section_stage_errors())
+        sections.append(self._section_confirmed_vs_likely())
         if self._profile:
             sections.append(self._section_stack())
         sections.append(self._section_top_findings())
+        if self._graphql_probe and self._graphql_probe.confirmed:
+            sections.append(self._section_graphql_probe())
+        if self._oauth_probe and self._oauth_probe.confirmed:
+            sections.append(self._section_oauth_probe())
+        if self._race_probe and self._race_probe.confirmed:
+            sections.append(self._section_race_probe())
         sections.append(self._section_by_category())
         if self._jwt and self._jwt.findings:
             sections.append(self._section_jwt())
@@ -288,11 +323,63 @@ class Reporter:
             out["msf_ingest"] = (self._msf_ingest.to_dict()
                                  if hasattr(self._msf_ingest, "to_dict")
                                  else self._msf_ingest)
+        if self._graphql_probe:
+            out["graphql_probe"] = self._graphql_probe.to_dict()
+        if self._oauth_probe:
+            out["oauth_probe"] = self._oauth_probe.to_dict()
+        if self._race_probe:
+            out["race_probe"] = self._race_probe.to_dict()
+        if self._stage_timings:
+            out["stage_timings"] = self._stage_timings
+        if self._stage_errors:
+            out["stage_errors"] = self._stage_errors
         return out
 
     # ------------------------------------------------------------------
     # Markdown section builders
     # ------------------------------------------------------------------
+
+    def _section_stage_timings(self) -> str:
+        lines = ["## Pipeline stage timings", "", "| Stage | Status | ms |", "|---|---|---|"]
+        for t in sorted(self._stage_timings, key=lambda x: -x.get("elapsed_ms", 0)):
+            lines.append(
+                f"| {t.get('name', '?')} | {t.get('status', '?')} | {t.get('elapsed_ms', 0):.0f} |"
+            )
+        return "\n".join(lines)
+
+    def _section_stage_errors(self) -> str:
+        lines = ["## Stage errors (non-fatal)", ""]
+        for e in self._stage_errors:
+            lines.append(f"- {e}")
+        return "\n".join(lines)
+
+    def _section_confirmed_vs_likely(self) -> str:
+        c = self._summary_counts()
+        lines = [
+            "## Confirmed vs likely",
+            "",
+            f"- **Confirmed** (active verification + exploit subsystems): **{c['total_confirmed']}**",
+            f"- **Classifier likely** (score ≥ 35, not yet confirmed): **{c.get('likely_classifier', c['high'])}**",
+        ]
+        return "\n".join(lines)
+
+    def _section_graphql_probe(self) -> str:
+        lines = ["## GraphQL probe (confirmed)", ""]
+        for f in self._graphql_probe.confirmed[:15]:
+            lines.append(f"- [{f.severity}] `{f.test}` @ {f.url} — {f.evidence}")
+        return "\n".join(lines)
+
+    def _section_oauth_probe(self) -> str:
+        lines = ["## OAuth probe (confirmed)", ""]
+        for f in self._oauth_probe.confirmed[:15]:
+            lines.append(f"- [{f.severity}] `{f.test}` @ {f.url} — {f.evidence}")
+        return "\n".join(lines)
+
+    def _section_race_probe(self) -> str:
+        lines = ["## Race probe (confirmed)", ""]
+        for f in self._race_probe.confirmed[:15]:
+            lines.append(f"- {f.method} {f.url} — {f.evidence}")
+        return "\n".join(lines)
 
     def _section_header(self) -> str:
         counts = self._summary_counts()
@@ -1122,6 +1209,9 @@ class Reporter:
             "scm_critical_exposures": scm_critical_c,
             "scm_total_exposures": scm_total_c,
             "total_confirmed": total_confirmed,
+            "likely_classifier": sum(
+                1 for f in self._result.request_findings if f.score >= 35
+            ),
         }
 
     def _section_jwt(self) -> str:

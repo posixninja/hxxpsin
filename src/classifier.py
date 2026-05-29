@@ -63,7 +63,7 @@ class Finding:
     response_body: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "score": self.score,
             "method": self.method,
             "url": self.url,
@@ -71,6 +71,15 @@ class Finding:
             "evidence": self.evidence,
             "body": self.body,
         }
+        try:
+            from confidence import from_classifier_score
+            label = from_classifier_score(self.score)
+            d["confidence"] = label.confidence
+            d["severity"] = label.severity.value
+            d["verdict"] = label.verdict.value
+        except Exception:
+            pass
+        return d
 
     def to_full_dict(self) -> dict:
         """Lossless serialization — includes request headers and the captured

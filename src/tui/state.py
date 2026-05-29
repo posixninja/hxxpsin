@@ -76,6 +76,7 @@ class AppState:
 
     # LLM agentic decisions (challenge solver + briefing generator)
     llm_decisions: list[dict] = field(default_factory=list)
+    stage_status: dict[str, dict] = field(default_factory=dict)
 
     # Saved targets
     targets: list[dict] = field(default_factory=list)
@@ -174,6 +175,15 @@ class AppState:
             if isinstance(decision, dict):
                 self.llm_decisions.append(decision)
                 self.emit("llm_decision", decision)
+        elif event in ("stage_start", "stage_done", "stage_error"):
+            payload = args[0] if args and isinstance(args[0], dict) else {}
+            name = payload.get("name", "?")
+            if name:
+                self.stage_status[name] = payload
+            self.step_log.append(
+                f"  stage {name}: {payload.get('status', 'running')}"
+            )
+            self.emit(event, payload)
 
     def _load_collector(self, p: Path) -> None:
         collector_path = p / "collector.json"
@@ -223,7 +233,25 @@ class AppState:
             "auto_fuzz":    "auto_fuzz.json",
             "ws":           "ws_probe.json",
             "ct":           "ct_probe.json",
+            "graphql":      "graphql_probe.json",
+            "oauth":        "oauth_probe.json",
+            "race":         "race_probe.json",
         }
+        sched_path = p / "stages" / "_scheduler.json"
+        if sched_path.exists():
+            try:
+                sched = json.loads(sched_path.read_text())
+                for name, rec in (sched.get("records") or {}).items():
+                    self.stage_status[name] = rec
+                    st = rec.get("status", "")
+                    if st == "done":
+                        self.probe_status[name] = "done"
+                    elif st == "error":
+                        self.probe_status[name] = "failed"
+                    elif st == "running":
+                        self.probe_status[name] = "running"
+            except Exception as e:
+                self.step_log.append(f"[load error] stages/_scheduler.json: {e}")
         self.findings = []
         for probe, filename in probe_files.items():
             fp = p / filename

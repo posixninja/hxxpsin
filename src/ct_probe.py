@@ -105,9 +105,10 @@ _REJECTION_STATUSES = {415}
 
 
 class CTProbe:
-    def __init__(self, auth_headers: dict = None, timeout: float = 8.0):
+    def __init__(self, auth_headers: dict = None, timeout: float = 8.0, http_cache=None):
         self._auth = auth_headers or {}
         self._timeout = timeout
+        self.http_cache = http_cache
 
     async def run(self, findings) -> CTProbeResult:
         """findings: list of classifier Finding objects."""
@@ -117,7 +118,10 @@ class CTProbe:
         if not candidates:
             return result
 
-        async with httpx.AsyncClient(
+        from probe_http import open_probe_client
+
+        async with open_probe_client(
+            self.http_cache,
             verify=False,
             follow_redirects=False,
             timeout=self._timeout,

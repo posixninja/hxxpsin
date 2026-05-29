@@ -52,6 +52,23 @@ def _consume_override() -> str:
     return msg
 
 
+def format_stage_context(stage_timings: list[dict] | None, stage_errors: list[str] | None = None) -> str:
+    """Compact pipeline timing summary for LLM briefing prompts."""
+    lines: list[str] = []
+    if stage_timings:
+        lines.append("Pipeline stages (ms):")
+        for t in sorted(stage_timings, key=lambda x: -x.get("elapsed_ms", 0))[:20]:
+            lines.append(
+                f"  - {t.get('name', '?')}: {t.get('status', '?')} "
+                f"({t.get('elapsed_ms', 0):.0f}ms)"
+            )
+    if stage_errors:
+        lines.append("Stage errors:")
+        for e in stage_errors[:10]:
+            lines.append(f"  - {e}")
+    return "\n".join(lines) if lines else ""
+
+
 # ---------------------------------------------------------------------------
 # Output shape
 # ---------------------------------------------------------------------------
@@ -179,6 +196,8 @@ async def generate_briefing(
     bundle: ReconBundle, finding: Finding, target: str,
     llm_generate: LLMCall,
     *, temperature: float = 0.0, max_tokens: int = 1500,
+    stage_timings: list[dict] | None = None,
+    stage_errors: list[str] | None = None,
 ) -> Briefing:
     """Send the recon bundle through the condenser LLM call and return a
     Briefing. The caller provides `llm_generate`, which must accept the
@@ -187,6 +206,9 @@ async def generate_briefing(
     .output_tokens, .elapsed_ms, .error — same shape every provider already
     returns from its generate() method."""
     prompt = _build_condense_prompt(bundle, finding, target)
+    stage_ctx = format_stage_context(stage_timings, stage_errors)
+    if stage_ctx:
+        prompt = stage_ctx + "\n\n" + prompt
     override = _consume_override()
     if override:
         prompt = (

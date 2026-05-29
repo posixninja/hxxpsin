@@ -83,6 +83,11 @@ from sql_probe import SQLProbe
 from upload_probe import UploadProbe
 from repeater import Repeater, ReplayRequest
 from reporter import Reporter
+from adaptive_planner import plan_stages, static_plan
+from http_cache import HttpCache, HttpGovernorConfig
+from pipeline_state import PipelineState
+from pipeline_stages import build_probe_stages
+from scheduler import run_stages
 from stackprint import Stackprint, StackProfile
 from surface_mapper import SurfaceMapperConfig, map_surface
 from verifier import Verifier, VerifyReport, verify_cors, verify_js_findings
@@ -179,6 +184,7 @@ class _ScanContext:
     msf_client: Optional[object] = None        # msf_ingest.MSFClient or None
     msf_workspace: str = ""                    # effective workspace for this scan
     msf_result: Optional[object] = None        # msf_ingest.MSFIngestResult, mutated in place
+    http_cache: Optional[HttpCache] = None
 
     def to_dict(self) -> dict:
         return {
@@ -220,6 +226,20 @@ async def _build_scan_context(args) -> _ScanContext:
         _err(f"[*] config: {auth_config.summary_for_target(cfg, args.target)}")
 
     ctx = _ScanContext(config=cfg, target_profile=tp)
+
+    try:
+        hg = cfg.http
+        gov_cfg = HttpGovernorConfig(
+            max_concurrent=hg.max_concurrent,
+            requests_per_second=hg.requests_per_second,
+            allow_hosts=list(hg.allow_hosts),
+            deny_paths=list(hg.deny_paths),
+        )
+        ctx.http_cache = HttpCache(args.target, gov_cfg, timeout=getattr(args, "timeout", 8.0))
+        await ctx.http_cache.__aenter__()
+        _err(f"[*] HttpCache: rps={hg.requests_per_second} max_concurrent={hg.max_concurrent}")
+    except Exception as exc:
+        _err(f"⚠ HttpCache init failed: {exc}")
 
     # Mail backend — operator's [mail.*] block referenced by target, else None
     if tp.mail is not None:
@@ -348,6 +368,11 @@ async def _teardown_scan_context(ctx: Optional[_ScanContext], out: Path) -> None
     """Persist tunnel hits + close everything."""
     if ctx is None:
         return
+    if ctx.http_cache is not None:
+        try:
+            await ctx.http_cache.__aexit__(None, None, None)
+        except Exception:
+            pass
     if ctx.payload_server is not None:
         try:
             hits = [h.to_dict() for h in ctx.payload_server.hits]
@@ -1039,6 +1064,143 @@ async def _rescan_auth_gated_findings(col: Collector, classifier_result,
     return fetched
 
 
+async def _run_scheduled_probe_wave(
+    args,
+    ps: PipelineState,
+    *,
+    offset: int,
+    total_steps: int,
+) -> PipelineState:
+    """Run parallel probe stages via the scheduler."""
+    _step(offset + 3, total_steps, "Scheduled probe wave (concurrent)")
+
+    category_counts = {
+        cat: len(findings)
+        for cat, findings in ps.result.by_category.items()
+    }
+    stack_summary = f"server={ps.profile.detected.get('server', '?')} cdn={bool(ps.profile.detected.get('cdn'))}"
+    llm_gen = None
+    if getattr(args, "adaptive_plan", False) and _servus_configured(ps.ctx()):
+        try:
+            import servus_client
+            client = servus_client.default_client()
+
+            async def _gen(prompt, system=None, **kw):
+                reply = await client.generate(
+                    messages=[{"role": "user", "content": prompt}],
+                    system=system or "",
+                    expect_json=True,
+                )
+                return reply.reply
+
+            llm_gen = _gen
+        except Exception:
+            pass
+
+    ps.planner = await plan_stages(
+        target=args.target,
+        stack_summary=stack_summary,
+        category_counts=category_counts,
+        llm_generate=llm_gen,
+        passive=ps.passive(),
+        active_scan=getattr(args, "active_scan", False),
+        auto_fuzz=getattr(args, "auto_fuzz", False),
+    )
+    if not getattr(args, "adaptive_plan", False):
+        ps.planner = static_plan(
+            passive=ps.passive(),
+            active_scan=getattr(args, "active_scan", False),
+            auto_fuzz=getattr(args, "auto_fuzz", False),
+            has_graphql=category_counts.get("GraphQL", 0) > 0,
+            has_race=category_counts.get("Race Condition", 0) > 0,
+            has_oauth_urls=category_counts.get("Auth/Session", 0) > 0,
+        )
+    (ps.out / "planner.json").write_text(json.dumps(ps.planner.to_dict(), indent=2))
+
+    def _on_stage_event(event: str, payload: dict) -> None:
+        _emit(event, payload)
+        name = payload.get("name", "?")
+        if event == "stage_start":
+            _err(f"  [stage] ▶ {name}")
+        elif event == "stage_done":
+            st = payload.get("status", "?")
+            ms = payload.get("elapsed_ms", 0)
+            _err(f"  [stage] ✓ {name} ({st}, {ms:.0f}ms)")
+
+    resume_dir = Path(args.resume) if getattr(args, "resume", None) else None
+    ps.scheduler_result = await run_stages(
+        build_probe_stages(ps),
+        ps,
+        out_dir=ps.out if not resume_dir else resume_dir,
+        max_concurrent=getattr(args, "stage_concurrency", 6),
+        resume=bool(resume_dir),
+        on_event=_on_stage_event,
+    )
+    for rec in ps.scheduler_result.records.values():
+        if rec.error:
+            ps.stage_errors.append(f"{rec.name}: {rec.error.message}")
+    if ps.http_cache is not None:
+        st = ps.http_cache.stats()
+        _err(f"[*] HttpCache: {st['cached_entries']} cached responses")
+    return ps
+
+
+async def _write_pipeline_report(
+    args, ps: PipelineState, profile: StackProfile, col: Collector,
+    out: Path, start: float, offset: int, total_steps: int,
+    har_result=None, scm_probe_result=None,
+) -> tuple[str, str]:
+    """Always-run report writer — safe to call from finally."""
+    _step(offset + 11, total_steps, "Writing report")
+    _ctx = ps.ctx()
+    _tunnel_hits = list(_ctx.payload_server.hits) if (_ctx and _ctx.payload_server) else []
+    _tunnel_info = _ctx.to_dict() if _ctx else {}
+    _msf_ingest_obj = _ctx.msf_result if (_ctx and _ctx.msf_result) else None
+    stage_timings = ps.scheduler_result.stage_timings if ps.scheduler_result else []
+    reporter = Reporter(
+        ps.result,
+        target=args.target,
+        profile=profile,
+        desync=ps.desync_result,
+        jwt=ps.jwt_result,
+        params=ps.param_result,
+        active_scan=ps.active_result,
+        redirect=ps.redirect_result,
+        crlf=ps.crlf_result,
+        nosql=ps.nosql_result,
+        sql_probe=ps.sql_probe_result,
+        auto_auth=ps.auto_auth_session,
+        auth_bypass=ps.auth_bypass_result,
+        challenges=ps.challenge_diff,
+        idor=ps.idor_result,
+        dom_xss=ps.dom_xss_result,
+        files=ps.grabber_result,
+        har=har_result,
+        access_replay=ps.access_replay_result,
+        enrichment=ps.enrichment_result,
+        data_extract=ps.data_extract_result,
+        llm_verification=ps.llm_verification_result,
+        solver=ps.solver_result,
+        upload_probe=ps.upload_probe_result,
+        sql_dump=ps.sql_dump_result,
+        ldap_dump=ps.ldap_dump_result,
+        scm_probe=scm_probe_result,
+        ws_probe=ps.ws_probe_result,
+        ct_probe=ps.ct_probe_result,
+        auto_fuzz=ps.auto_fuzz_result,
+        tunnel_hits=_tunnel_hits,
+        tunnel_info=_tunnel_info,
+        msf_ingest=_msf_ingest_obj,
+        graphql_probe=ps.graphql_result,
+        oauth_probe=ps.oauth_result,
+        race_probe=ps.race_result,
+        stage_timings=stage_timings,
+        stage_errors=ps.stage_errors,
+        verify_report=ps.verify_report,
+    )
+    return reporter.write(str(out))
+
+
 async def _finish_pipeline(
     args, profile: StackProfile, col: Collector,
     out: Path, start: float, total_steps: int, step_offset: int,
@@ -1221,676 +1383,314 @@ async def _finish_pipeline(
             else:
                 _err(f"  ✗ Auto-auth: no credentials harvested ({len(auto_auth_session.notes)} attempts)")
 
-    # ── JWT attack analysis ───────────────────────────────────────────────
-    _step(offset + 3, total_steps, "JWT attack analysis")
-    jwt_result = None
-    if getattr(args, "passive", False):
-        _err("JWT: skipped (passive mode)")
-    else:
-        auth_findings = result.by_category.get("Auth/Session", [])
-        if auth_findings or result.cookie_findings:
-            jwt_result = await JWTAnalyzer(
-                auth_headers=auth_hdrs,
-                timeout=args.timeout,
-                canary=canary,
-                grabbed_key_files=grabber_result.grabbed,
-            ).run(auth_findings, result.cookie_findings)
-            _err(f"JWT: {jwt_result.tokens_tested} tokens tested, "
-                 f"{len(jwt_result.confirmed)} attacks confirmed")
-
-    # ── hidden parameter discovery ────────────────────────────────────────
-    _step(offset + 4, total_steps, "Hidden parameter discovery")
-    param_result = None
-    if getattr(args, "passive", False):
-        _err("Param miner: skipped (passive mode)")
-    elif not getattr(args, "no_param_mine", False):
-        param_result = await ParamMiner(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-            top_n=getattr(args, "param_mine_top", 10),
-        ).run(result.request_findings)
-        interesting_n = len(param_result.interesting)
-        _err(f"Param miner: {param_result.endpoints_probed} endpoints probed, "
-             f"{interesting_n} interesting params found")
-    else:
-        _err("Param miner: disabled (--no-param-mine)")
-
-    # ── verify ───────────────────────────────────────────────────────────
-    passive = getattr(args, "passive", False)
-    if passive:
-        _step(offset + 5, total_steps, "Verify: skipped (passive mode)")
-        # Build a real (empty) VerifyReport rather than a stub so every
-        # downstream code path that touches it (subsystem counts, JSON dump,
-        # passing through to active_result.run) sees a normal object.
-        verify_report = VerifyReport(results=[])
-    else:
-        _step(offset + 5, total_steps, "Verifying findings (active probes)")
-        verify_report = await Verifier(
-            result.request_findings,
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-            origin=args.target,
-            canary=canary,
-        ).run()
-
-        # CORS pass — deduplicated check across all discovered API URLs
-        api_urls = [f.url for f in result.request_findings]
-        cors_results = await verify_cors(api_urls, auth_hdrs, timeout=args.timeout)
-        verify_report.results.extend(cors_results)
-
-        # JS secrets + source maps pass
-        if js_result is not None:
-            js_verify = await verify_js_findings(js_result, args.target, auth_hdrs, timeout=args.timeout)
-            verify_report.results.extend(js_verify)
-
-    # NOTE: this counts only the Verifier subsystem. Auth-bypass, active-scan,
-    # IDOR, etc. each report their own confirmation totals further below.
-    # The unified roll-up appears at the top of the markdown report.
-    _err(f"Verifier: {len(verify_report.confirmed)} confirmed  "
-         f"{len(verify_report.likely)} likely  "
-         f"{len([r for r in verify_report.results if r.verdict == 'not_confirmed'])} not-confirmed")
-    for r in verify_report.confirmed:
-        _err(f"  ✓ [{r.categories[0] if r.categories else '?'}] {r.method} {r.url[:60]}")
-        _err(f"      {r.evidence}")
-    (out / "verify.json").write_text(json.dumps(verify_report.to_dict(), indent=2))
-
-    # ── open redirect probe (scan only — skip in quick mode, no crawl data) ─
-    _step(offset + 6, total_steps, "Open redirect probing")
-    redirect_result = None
-    if passive:
-        _err("Open redirect: skipped (passive mode)")
-    elif os.environ.get("HXXPSIN_SKIP_REDIRECT"):
-        _err("Open redirect: skipped (HXXPSIN_SKIP_REDIRECT set)")
-    elif getattr(args, "har", None) or not getattr(args, "_quick_mode", False):
-        _ctx = getattr(args, "_ctx", None)
-        redirect_result = await OpenRedirectProbe(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-            browser_verifier=browser_verifier,
-            payload_server=(_ctx.payload_server if _ctx else None),
-            public_url=(_ctx.public_url if _ctx else None),
-        ).run(result.request_findings)
-        _err(f"Open redirect: {redirect_result.endpoints_tested} endpoints tested, "
-             f"{len(redirect_result.confirmed)} confirmed")
-    else:
-        _err("Open redirect: skipped in quick mode")
-
-    # ── active injection scan (opt-in) ────────────────────────────────────
-    active_result = None
-    nosql_result = None
-    sql_probe_result = None
-    auth_bypass_result = None
-    idor_result = None
-    account_a: Optional[Account] = None
-    account_b: Optional[Account] = None
-    if getattr(args, "active_scan", False):
-        _step(offset + 7, total_steps, "Active injection scan (--active-scan)")
-        _ctx = getattr(args, "_ctx", None)
-        active_result = await ActiveScanner(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-            canary=canary,
-            browser_verifier=browser_verifier,
-            payload_server=(_ctx.payload_server if _ctx else None),
-            public_url=(_ctx.public_url if _ctx else None),
-        ).run(
-            verify_report.results,
-            param_result.interesting if param_result else None,
-            classifier_findings=result.request_findings,
-        )
-        _err(f"Active scan: {active_result.endpoints_scanned} endpoints, "
-             f"{len(active_result.confirmed)} confirmed")
-
-        _err("[+] NoSQL injection probing (--active-scan)")
-        nosql_result = await NoSQLProbe(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-        ).run(result.request_findings)
-        _err(f"NoSQL: {nosql_result.endpoints_tested} endpoints tested, "
-             f"{len(nosql_result.confirmed)} confirmed")
-
-        # MSSQL dialect probe + NTLM coercion via SMB sink
-        _err("[+] MSSQL probing (--active-scan)")
-        _ctx = getattr(args, "_ctx", None)
-        sql_probe_result = await SQLProbe(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-            canary=canary,
-            payload_server=(_ctx.payload_server if _ctx else None),
-            smb_sink=(_ctx.smb_sink if _ctx else None),
-            public_url=(_ctx.public_url if _ctx else None),
-            stack_profile=profile,
-            allow_destructive=getattr(args, "allow_windows_destructive", False),
-        ).run(result.request_findings, active_result=active_result)
-        _err(f"SQL probe: {sql_probe_result.endpoints_tested} endpoints tested, "
-             f"{len(sql_probe_result.confirmed)} confirmed, "
-             f"{sql_probe_result.ntlm_hashes_captured} NTLM hash(es) captured")
-        for f in sql_probe_result.confirmed[:5]:
-            _err(f"  ✓ {f.attack_type} {f.endpoint[:60]} — {f.evidence[:80]}")
-
-        _err("[+] Auth-bypass fuzzing (--active-scan)")
-        auth_bypass_result = await AuthBypassProbe(
-            timeout=args.timeout,
-        ).run(result, target=args.target)
-        _err(f"Auth bypass: {auth_bypass_result.endpoints_tested} login endpoints tested, "
-             f"{auth_bypass_result.payloads_sent} payloads sent, "
-             f"{len(auth_bypass_result.confirmed)} confirmed")
-        for f in auth_bypass_result.confirmed[:5]:
-            _err(f"  ✓ {f.endpoint} field={f.field} payload={f.payload!r}")
-
-        # ── Cross-account IDOR (BOLA) probe ─────────────────────────────
-        # Wires up the long-dormant --auth-a / --auth-b flags. In auto mode
-        # we use the existing auto_auth_session as account A and provision
-        # a second account via AutoAuth for account B.
-        _err("[+] Cross-account IDOR / BOLA probing (--active-scan)")
-        if getattr(args, "auth_a", None) and getattr(args, "auth_b", None):
-            account_a = IDORProbe.load_account_from_storage_state(args.auth_a, "A")
-            account_b = IDORProbe.load_account_from_storage_state(args.auth_b, "B")
-            if account_a and account_b:
-                _err("  loaded accounts from --auth-a / --auth-b")
-            else:
-                _err("  ✗ failed to load --auth-a or --auth-b storage states")
-        elif not getattr(args, "no_auto_auth", False):
-            # Use existing auth_a from prior auto_auth or manual headers
-            if auto_auth_session and auto_auth_session.has_auth:
-                account_a = IDORProbe.account_from_auto_auth(auto_auth_session, "A")
-            elif auth_hdrs:
-                account_a = Account(label="A", headers=dict(auth_hdrs))
-            if account_a:
-                _err("  provisioning second account for cross-account comparison...")
-                js_routes2 = list(col._js_routes) if hasattr(col, "_js_routes") else None
-                second_session = await AutoAuth(
-                    args.target, timeout=args.timeout,
-                    email_domain=getattr(args, "auth_email_domain", None),
-                    **_auto_auth_kwargs_from_ctx(args, fresh_account=True),
-                ).run(classifier_result=result, js_routes=js_routes2)
-                account_b = IDORProbe.account_from_auto_auth(second_session, "B")
-                if account_b:
-                    _err(f"  ✓ second account: {second_session.credentials.username}")
-                else:
-                    _err("  ✗ second-account provisioning failed")
-
-        idor_result = await IDORProbe(timeout=args.timeout).run(
-            target=args.target,
-            account_a=account_a,
-            account_b=account_b,
-            classifier_findings=result.request_findings,
-        )
-        _err(f"Cross-account IDOR: {idor_result.endpoints_tested} endpoints, "
-             f"{len(idor_result.confirmed)} confirmed, {len(idor_result.likely)} likely")
-        for f in idor_result.confirmed[:5]:
-            _err(f"  ✓ [{f.test_kind}] {f.method} {f.url[:70]}")
-    else:
-        _step(offset + 7, total_steps, "Active scan: skipped (pass --active-scan to enable)")
-
-    # ── desync probe ─────────────────────────────────────────────────────
-    _step(offset + 8, total_steps, "Desync / cache / protocol probes")
-    desync_result = None
-    if passive:
-        _err("Desync: skipped (passive mode)")
-    else:
-        desync_urls = urls_from_classifier(result)
-        if not desync_urls:
-            desync_urls = [args.target]
-        desync_probe = DesyncProbe(
-            desync_urls[:15],
-            profile=profile,
-            timeout=args.timeout,
-        )
-        desync_result = await desync_probe.run()
-        _err(f"Desync findings: {len(desync_result.findings)} ({len(desync_result.high())} high)")
-
-    # ── Auto-fuzz (opt-in: --auto-fuzz) ──────────────────────────────────
-    # Runs the Intruder payload library against every discovered parameter:
-    # URL path IDs, query params, and JSON body fields. Category-aware payload
-    # selection (IDOR→ids, Injection→sqli+xss+ssti, SSRF→redirects, etc.).
-    # Independent of --active-scan so it can be used without the full suite.
-    auto_fuzz_result = None
-    if getattr(args, "auto_fuzz", False):
-        _step(offset + 9, total_steps, "Auto-fuzz: Intruder payloads on discovered params (--auto-fuzz)")
-        auto_fuzz_result = await auto_fuzz_findings(
-            result.request_findings,
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-        )
-        _err(f"Auto-fuzz: {auto_fuzz_result.endpoints_fuzzed} endpoints, "
-             f"{auto_fuzz_result.requests_sent} requests, "
-             f"{len(auto_fuzz_result.findings)} anomalies")
-        for af in auto_fuzz_result.findings[:8]:
-            _err(f"  ? {af.method} {af.url[:60]}  pos={af.position!r}  "
-                 f"payload={af.payload[:25]!r}  [{af.anomaly[:50]}]")
-        (out / "auto_fuzz.json").write_text(
-            json.dumps(auto_fuzz_result.to_dict(), indent=2)
-        )
-    else:
-        _err("Auto-fuzz: skipped (pass --auto-fuzz to enable)")
-
-    # ── CRLF probe (always-on, except passive mode) ──────────────────────
-    _step(offset + 9, total_steps, "CRLF injection probing")
-    if passive:
-        crlf_result = None
-        _err("CRLF: skipped (passive mode)")
-    else:
-        crlf_result = await CRLFProbe(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-        ).run([f.url for f in result.request_findings[:20]])
-        _err(f"CRLF: {crlf_result.urls_tested} URLs tested, {len(crlf_result.confirmed)} confirmed")
-
-    # ── Content-type confusion probe ─────────────────────────────────────
-    # Replays XHR JSON state-change findings with text/plain and form-urlencoded
-    # Content-Types. If the server returns the same 2xx, the body is processed
-    # without a type check — a cross-origin HTML form can submit it without a
-    # CORS preflight, bypassing CORS-as-CSRF-protection entirely.
-    if passive:
-        ct_probe_result = CTProbeResult()
-    else:
-        ct_probe_result = await CTProbe(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-        ).run(result.request_findings)
-    if ct_probe_result.endpoints_tested:
-        _err(
-            f"CT confusion: {ct_probe_result.endpoints_tested} endpoints tested, "
-            f"{len(ct_probe_result.findings)} confirmed"
-        )
-        for f in ct_probe_result.findings[:5]:
-            _err(f"  ✓ [{f.severity.upper()}] {f.method} {f.url[:70]} "
-                 f"accepts '{f.confused_ct}'")
-        (out / "ct_probe.json").write_text(
-            json.dumps(ct_probe_result.to_dict(), indent=2)
-        )
-    else:
-        _err("CT confusion: no XHR JSON state-change endpoints found — skipped")
-
-    # ── WebSocket security probe ─────────────────────────────────────────
-    # Gather WS URLs from passive capture, JS bundle extraction, and stackprint.
-    # Then actively test each one: CSWSH (spoofed Origin), unauthenticated
-    # access (no auth headers), null-origin, and subscription/channel IDOR.
-    ws_probe_result = None
-    if passive:
-        ws_probe_result = WSProbeResult()
-    else:
-        ws_urls: list[str] = [ws.url for ws in col.websockets]
-        if js_result:
-            ws_urls.extend(js_result.websocket_urls)
-        ws_urls.extend(getattr(profile, "websocket_urls", []))
-        ws_probe_result = await WSProbe(
-            auth_headers=auth_hdrs,
-            timeout=args.timeout,
-        ).run(
-            ws_urls=ws_urls,
-            captured_websockets=col.websockets,
-            # Always probe the target origin for Socket.io even when no WS URL
-            # was passively captured (chatbot / real-time features that only fire
-            # after user interaction won't show up in the passive crawler results).
-            http_origins=[args.target],
-        )
-    if ws_probe_result.urls_tested:
-        _err(
-            f"WS probe: {len(ws_probe_result.urls_tested)} URLs tested, "
-            f"{len(ws_probe_result.confirmed)} findings"
-        )
-        for f in ws_probe_result.confirmed:
-            _err(f"  ✓ [{f['severity'].upper()}] {f['category']} — {f['url'][:70]}")
-        (out / "ws_probe.json").write_text(
-            json.dumps(ws_probe_result.to_dict(), indent=2)
-        )
-    else:
-        _err("WS probe: no WebSocket URLs discovered — skipped")
-
-    # ── Access bypass replay ─────────────────────────────────────────────
-    # Re-attempt URLs that returned 401/403 during the crawl using any auth
-    # bypass we discovered later (forged JWTs, harvested SQLi tokens, the
-    # second IDOR account). When a forbidden URL flips to 2xx, save the body
-    # for offline analysis — this is the "go back and download what we
-    # couldn't access before" pass.
-    access_replay_result = None
-    if not getattr(args, "no_access_replay", False) and not getattr(args, "passive", False):
-        bypass_tokens: list[BypassToken] = []
-        bypass_tokens.extend(tokens_from_jwt_attack(jwt_result, baseline_headers=auth_hdrs))
-        bypass_tokens.extend(tokens_from_auth_bypass(auth_bypass_result, baseline_headers=auth_hdrs))
-        bypass_tokens.extend(tokens_from_idor(idor_result, account_b))
-        # Always include the current session as a sanity baseline — if a 403
-        # flips to 200 with the *same* headers we already had, that's a transient
-        # crawl-time failure worth surfacing too.
-        if auth_hdrs:
-            bypass_tokens.append(BypassToken(
-                label="current_session", source="baseline",
-                headers=dict(auth_hdrs),
-                evidence="re-fetch with the headers already in use",
-            ))
-        access_replay_result = await AccessReplayProbe(
-            out_dir=str(out), timeout=args.timeout,
-        ).run(col, bypass_tokens)
-        if access_replay_result.forbidden_urls_seen:
-            _err(f"Access replay: {access_replay_result.forbidden_urls_seen} forbidden URLs, "
-                 f"{access_replay_result.bypass_tokens_tried} bypass tokens, "
-                 f"{len(access_replay_result.unlocked)} unlocked "
-                 f"({access_replay_result.total_bytes_recovered // 1024} KB recovered)")
-            for u in access_replay_result.unlocked[:8]:
-                _err(f"  ✓ {u.original_status}→{u.new_status} [{u.bypass_source}] {u.url[:70]}")
-        else:
-            _err("Access replay: no 401/403 responses recorded — nothing to replay")
-        (out / "access_replay.json").write_text(
-            json.dumps(access_replay_result.to_dict(), indent=2)
-        )
-
-    # ── Challenge tracker post-snapshot + diff ────────────────────────────
-    challenge_diff = None
-    if not pre_snapshot.is_empty():
-        post_snapshot = await tracker.snapshot()
-        challenge_diff = ChallengeTracker.diff(pre_snapshot, post_snapshot)
-        _err(f"[*] Challenge tracker: {challenge_diff.newly_triggered} new challenges solved during scan")
-        for c in challenge_diff.triggered[:10]:
-            _err(f"  ✓ [{c.difficulty}] {c.name} — {c.category}")
-
-    # ── targeted post-classifier rescan ──────────────────────────────────
-    # Generic across any web app: for any classified Auth/Admin/IDOR/User
-    # finding whose body we never captured (typically because the SPA
-    # didn't link to it but JS analysis or stackprint discovered the path),
-    # fetch it once with the harvested token so the enricher can mine it.
-    # This is what lets us pull per-user passwords from endpoints like
-    # /rest/user/authentication-details/ without hardcoding that path.
-    if auth_hdrs:
-        rescanned = await _rescan_auth_gated_findings(
-            col, result, args.target, auth_hdrs, args.timeout,
-        )
-        if rescanned:
-            _err(f"Rescan: backfilled {rescanned} auth-gated bodies the crawler missed")
-
-    # ── enrichment ───────────────────────────────────────────────────────
-    # Mine every captured response body for users, hosts, secrets, images
-    # and unvisited URLs. Writes per-entity folders under <out>/enrichment/.
-    _step(offset + 10, total_steps, "Enriching response bodies (users, hosts, secrets, images)")
-    extra_bodies = []
-    if access_replay_result:
-        for u in access_replay_result.unlocked:
-            if u.body_path and Path(u.body_path).exists():
-                try:
-                    extra_bodies.append({
-                        "url": u.url, "method": u.method,
-                        "body": Path(u.body_path).read_text(errors="replace"),
-                        "content_type": u.content_type,
-                    })
-                except Exception:
-                    pass
-    enrichment_result = Enricher(
-        out_dir=str(out), target_origin=args.target,
-    ).run(
-        col,
-        extra_bodies=extra_bodies or None,
-        file_grabber_result=grabber_result,
-        auto_auth_session=auto_auth_session,
+    # ── Scheduled concurrent probe wave ─────────────────────────────────
+    _ctx_scan = getattr(args, "_ctx", None)
+    ps = PipelineState(
+        args=args, profile=profile, col=col, out=out,
+        start=start, total_steps=total_steps, step_offset=offset,
+        har_result=har_result, pre_auth_session=pre_auth_session,
+        scm_probe_result=scm_probe_result,
+        canary=canary, browser_verifier=browser_verifier,
+        http_cache=_ctx_scan.http_cache if _ctx_scan else None,
+        grabber_result=grabber_result, pre_snapshot=pre_snapshot,
+        js_result=js_result, dom_xss_result=dom_xss_result,
+        result=result, auto_auth_session=auto_auth_session,
+        auth_hdrs=auth_hdrs,
     )
-    # MSF creds/loot/notes/vulns → enrichment (in place; mutates
-    # ctx.msf_result so the Reporter sees one combined object).
-    _ctx_msf = getattr(args, "_ctx", None)
-    if _ctx_msf is not None and _ctx_msf.msf_client is not None:
-        try:
-            _ctx_msf.msf_result = await msf_ingest.merge_msf_into_enrichment(
-                enrichment_result, _ctx_msf.msf_client,
-                _ctx_msf.msf_workspace or "default",
-                accum=_ctx_msf.msf_result,
-                log_cb=lambda ev, fields: _err(f"[msf] {ev} {fields}"),
+    ps = await _run_scheduled_probe_wave(args, ps, offset=offset, total_steps=total_steps)
+    jwt_result = ps.jwt_result
+    param_result = ps.param_result
+    verify_report = ps.verify_report or VerifyReport(results=[])
+    redirect_result = ps.redirect_result
+    active_result = ps.active_result
+    nosql_result = ps.nosql_result
+    sql_probe_result = ps.sql_probe_result
+    auth_bypass_result = ps.auth_bypass_result
+    idor_result = ps.idor_result
+    account_a = ps.account_a
+    account_b = ps.account_b
+    desync_result = ps.desync_result
+    auto_fuzz_result = ps.auto_fuzz_result
+    crlf_result = ps.crlf_result
+    ct_probe_result = ps.ct_probe_result
+    ws_probe_result = ps.ws_probe_result
+    graphql_result = ps.graphql_result
+    oauth_result = ps.oauth_result
+    race_result = ps.race_result
+    access_replay_result = ps.access_replay_result
+
+    md_path, json_path = ("", "")
+    challenge_diff = enrichment_result = data_extract_result = None
+    upload_probe_result = sql_dump_result = ldap_dump_result = None
+    llm_verification_result = solver_result = None
+    try:
+        # ── Challenge tracker post-snapshot + diff ────────────────────────────
+        if not pre_snapshot.is_empty():
+            post_snapshot = await tracker.snapshot()
+            challenge_diff = ChallengeTracker.diff(pre_snapshot, post_snapshot)
+            _err(f"[*] Challenge tracker: {challenge_diff.newly_triggered} new challenges solved during scan")
+            for c in challenge_diff.triggered[:10]:
+                _err(f"  ✓ [{c.difficulty}] {c.name} — {c.category}")
+        
+        # ── targeted post-classifier rescan ──────────────────────────────────
+        # Generic across any web app: for any classified Auth/Admin/IDOR/User
+        # finding whose body we never captured (typically because the SPA
+        # didn't link to it but JS analysis or stackprint discovered the path),
+        # fetch it once with the harvested token so the enricher can mine it.
+        # This is what lets us pull per-user passwords from endpoints like
+        # /rest/user/authentication-details/ without hardcoding that path.
+        if auth_hdrs:
+            rescanned = await _rescan_auth_gated_findings(
+                col, result, args.target, auth_hdrs, args.timeout,
             )
-            r = _ctx_msf.msf_result
-            _err(f"[+] MSF merge: creds={r.pulled_creds} loot={r.pulled_loot} "
-                 f"notes={r.pulled_notes} vulns={r.pulled_vulns}")
-        except Exception as exc:
-            _err(f"⚠ msf merge failed: {type(exc).__name__}: {exc}")
-    s = enrichment_result.summary()
-    by_type = ", ".join(f"{k}:{v}" for k, v in sorted(s["users_by_type"].items())) or "—"
-    _err(f"Enrichment: {s['users']} identities ({by_type}), "
-         f"{s['oauth_apps']} oauth apps, {s['hosts']} hosts, "
-         f"{s['secrets']} secrets, {s['images_analyzed']} images analyzed, "
-         f"{s['unvisited_urls']} unvisited URLs")
-    # Loud password summary so the operator immediately sees crack rate
-    _err(f"  Passwords: {s['passwords_plaintext']} plaintext + "
-         f"{s['passwords_cracked']} cracked  →  "
-         f"{s['passwords_plaintext'] + s['passwords_cracked']} usable "
-         f"({s['passwords_uncracked']} hashes still uncracked)")
-    if s['passwords_plaintext'] + s['passwords_cracked'] > 0:
-        _err(f"  → see {s['out_dir']}/passwords.txt for the full <user>:<pass> list")
-    _err(f"  written to {s['out_dir']}/")
-
-    # ── IDOR-driven data extraction ──────────────────────────────────────
-    # When IDORProbe confirmed cross-account reads, walk the affected
-    # endpoints with each available identity to pull per-victim records.
-    data_extract_result = None
-    if idor_result and (idor_result.confirmed or idor_result.likely):
-        from data_extractor import DataExtractor, AccountTokens
-        accounts: list[AccountTokens] = []
-        if account_a and account_a.headers:
-            accounts.append(AccountTokens(
-                label=account_a.label, headers=dict(account_a.headers),
-                username=account_a.username, email=account_a.email,
-            ))
-        if account_b and account_b.headers:
-            accounts.append(AccountTokens(
-                label=account_b.label, headers=dict(account_b.headers),
-                username=account_b.username, email=account_b.email,
-            ))
-        if accounts:
-            _err(f"[+] IDOR data extractor: pulling records for "
-                 f"{len(idor_result.confirmed) + len(idor_result.likely)} endpoints "
-                 f"with {len(accounts)} accounts")
-            data_extract_result = await DataExtractor(
-                out_dir=str(out), timeout=args.timeout,
-            ).run(idor_result=idor_result, accounts=accounts)
-            _err(f"  pulled {data_extract_result.records_pulled} records "
-                 f"({data_extract_result.per_user_endpoints} per-user, "
-                 f"{data_extract_result.shared_endpoints} site-wide), "
-                 f"saved to {data_extract_result.out_dir}/")
-
-    # ── File-upload bypass tests ─────────────────────────────────────────
-    # For any classified Cat.UPLOAD endpoint (or POST + multipart + path
-    # match), run the full bypass suite (magic-byte spoof, double-ext,
-    # Content-Type bypass, traversal, SVG-XSS, polyglot, oversize).
-    upload_probe_result = None
-    if not getattr(args, "no_upload_probe", False):
-        _ctx = getattr(args, "_ctx", None)
-        upload_probe_result = await UploadProbe(
-            out_dir=str(out), timeout=args.timeout, auth_headers=auth_hdrs,
-            payload_server=(_ctx.payload_server if _ctx else None),
-            public_url=(_ctx.public_url if _ctx else None),
-        ).run(result)
-        if upload_probe_result.endpoints_tested:
-            _err(f"Upload probe: {upload_probe_result.endpoints_tested} endpoints, "
-                 f"{upload_probe_result.tests_sent} tests sent, "
-                 f"{len(upload_probe_result.confirmed)} confirmed RCE/XSS, "
-                 f"{len(upload_probe_result.accepted)} accepted")
-            for f in upload_probe_result.confirmed[:5]:
-                _err(f"  ✓ [{f.test_name}] {f.endpoint[:60]} — marker {f.execution_marker}")
-            (out / "upload_probe.json").write_text(
-                json.dumps(upload_probe_result.to_dict(), indent=2)
-            )
-
-    # ── SQL dump (when ActiveScanner confirmed SQLi) ─────────────────────
-    # Fingerprint dialect from confirmed SQLi response, replay UNION extraction
-    # to dump schema + interesting tables (users/accounts/sessions/orders).
-    # Cross-links any extracted user rows back into enrichment/users/<id>/db_rows/.
-    sql_dump_result = None
-    if active_result and not getattr(args, "no_sql_dump", False):
-        sql_dump_result = await SQLDumper(
-            out_dir=str(out), timeout=args.timeout, auth_headers=auth_hdrs,
-        ).run(active_result, enrichment_result=enrichment_result)
-        if sql_dump_result.fingerprints:
-            fp_str = ", ".join(f"{f.dialect}({f.confidence:.2f})"
-                                for f in sql_dump_result.fingerprints)
-            _err(f"SQL dump: dialect={fp_str}, "
-                 f"{len(sql_dump_result.schema)} tables in schema, "
-                 f"{sql_dump_result.tables_dumped} dumped, "
-                 f"{sql_dump_result.rows_dumped} rows pulled")
-        elif sql_dump_result.notes:
-            for n in sql_dump_result.notes:
-                _err(f"  SQL dump: {n}")
-        (out / "sql_dump.json").write_text(
-            json.dumps(sql_dump_result.to_dict(), indent=2)
+            if rescanned:
+                _err(f"Rescan: backfilled {rescanned} auth-gated bodies the crawler missed")
+        
+        # ── enrichment ───────────────────────────────────────────────────────
+        # Mine every captured response body for users, hosts, secrets, images
+        # and unvisited URLs. Writes per-entity folders under <out>/enrichment/.
+        _step(offset + 10, total_steps, "Enriching response bodies (users, hosts, secrets, images)")
+        extra_bodies = []
+        if access_replay_result:
+            for u in access_replay_result.unlocked:
+                if u.body_path and Path(u.body_path).exists():
+                    try:
+                        extra_bodies.append({
+                            "url": u.url, "method": u.method,
+                            "body": Path(u.body_path).read_text(errors="replace"),
+                            "content_type": u.content_type,
+                        })
+                    except Exception:
+                        pass
+        enrichment_result = Enricher(
+            out_dir=str(out), target_origin=args.target,
+        ).run(
+            col,
+            extra_bodies=extra_bodies or None,
+            file_grabber_result=grabber_result,
+            auto_auth_session=auto_auth_session,
         )
-
-    # ── LDAP/AD dump (when ActiveScanner / classifier surfaces LDAP injection) ──
-    # Vendor-fingerprint the directory (OpenLDAP / Active Directory / ApacheDS /
-    # OpenDJ), confirm boolean-blind injection at the param level, then extract
-    # high-value attributes (sAMAccountName, memberOf, userAccountControl, SPN,
-    # adminCount, LAPS, GMSA). AD UAC flags get parsed into named tags so
-    # KERBEROASTABLE / ASREPROASTABLE / DOMAIN_ADMIN / LAPS_READABLE surface
-    # directly in the report. Cross-links into enrichment/users/<id>/ldap/.
-    ldap_dump_result = None
-    if active_result and not getattr(args, "no_ldap_dump", False):
-        ldap_dump_result = await LDAPDumper(
-            out_dir=str(out), timeout=args.timeout, auth_headers=auth_hdrs,
-        ).run(active_result,
-              classifier_findings=result.request_findings,
-              enrichment_result=enrichment_result)
-        if ldap_dump_result.fingerprints:
-            fp_str = ", ".join(f"{f.vendor}({f.confidence:.2f})"
-                                for f in ldap_dump_result.fingerprints)
-            _err(f"LDAP dump: vendor={fp_str}, "
-                 f"{len(ldap_dump_result.confirmed_injections)} confirmed injection(s), "
-                 f"{len(ldap_dump_result.accounts)} account(s) dumped, "
-                 f"{len(ldap_dump_result.high_value)} high-value tag(s)")
-        elif ldap_dump_result.notes:
-            for n in ldap_dump_result.notes:
-                _err(f"  LDAP dump: {n}")
-        (out / "ldap_dump.json").write_text(
-            json.dumps(ldap_dump_result.to_dict(), indent=2)
-        )
-
-    # ── LLM verification (opt-in) ────────────────────────────────────────
-    # Local Ollama LLM verifies "likely" heuristic findings — adds llm_verdict
-    # to each finding without overriding the heuristic. Cache is on disk so
-    # repeated scans don't re-spend tokens.
-    llm_verification_result = None
-    if getattr(args, "llm", False):
-        _err(f"[+] LLM verification: model={args.llm_model} host={args.llm_host} "
-             f"budget={args.llm_budget}")
-        async with LLMClient(
-            host=args.llm_host, model=args.llm_model,
-            cache_dir=str(out / "llm_cache"),
-            budget=args.llm_budget, timeout=60.0,
-            verbose=False,
-        ) as llm:
-            if not await llm.is_alive():
-                _err(f"  ✗ Ollama not reachable at {args.llm_host} — skipping LLM step")
-            else:
-                verifier = LLMVerifier(llm)
-                await verifier.verify_idor(idor_result, account_a, account_b)
-                await verifier.verify_active_scan(active_result)
-                await verifier.verify_auth_bypass(auth_bypass_result)
-                llm_verification_result = verifier.result
-                s = llm.stats
-                _err(f"  LLM stats: {s.calls_made} calls, {s.cache_hits} cache hits, "
-                     f"{s.errors} errors, avg {s.total_elapsed_ms / max(s.calls_made, 1):.0f}ms")
-                _err(f"  Verdicts: {verifier.result.promoted_to_confirmed} promoted, "
-                     f"{verifier.result.refuted} refuted, "
-                     f"{verifier.result.inconclusive} inconclusive")
-                (out / "llm_verification.json").write_text(
-                    json.dumps(llm_verification_result.to_dict(), indent=2)
-                )
-
-    # ── Agentic solver (opt-in) ─────────────────────────────────────────
-    # Hand the top classifier findings to an LLM agent with http_request /
-    # browser_eval / read_finding / run_nuclei tools. Each finding gets a
-    # bounded turn budget; the agent returns a verdict + evidence per
-    # finding. Provider is selectable: 'claude' (Anthropic API, native
-    # tool-use) or 'ollama' (local model, ReAct JSON prompting).
-    solver_result = None
-    if getattr(args, "solve", False):
-        provider = (getattr(args, "solve_provider", "claude") or "claude").lower()
-        storage_state = args.auth or getattr(args, "auth_a", None)
-        # Pick model default based on provider when the user didn't specify
-        if not args.solve_model:
-            args.solve_model = {
-                "ollama": "qwen2.5:7b",
-                "openai": "gpt-5",
-                "claude": "claude-opus-4-7",
-            }.get(provider, "claude-opus-4-7")
-
-        # Forward solver events to the TUI so the LLM tab can show decisions live.
-        def _solver_event(kind, *evargs):
+        # MSF creds/loot/notes/vulns → enrichment (in place; mutates
+        # ctx.msf_result so the Reporter sees one combined object).
+        _ctx_msf = getattr(args, "_ctx", None)
+        if _ctx_msf is not None and _ctx_msf.msf_client is not None:
             try:
-                if kind == "solve_start" and len(evargs) >= 3:
-                    idx, method, url = evargs[0], evargs[1], evargs[2]
-                    _emit("llm_decision", {
-                        "stage": "start", "finding_index": idx,
-                        "method": method, "url": url,
-                        "model": args.solve_model, "provider": provider,
-                    })
-                elif kind == "solve_done" and len(evargs) >= 3:
-                    idx, verdict, reason = evargs[0], evargs[1], evargs[2]
-                    _emit("llm_decision", {
-                        "stage": "verdict", "finding_index": idx,
-                        "verdict": verdict, "reason": reason,
-                        "model": args.solve_model, "provider": provider,
-                    })
-            except Exception:
-                pass
-
-        if provider == "ollama":
-            _err(f"[+] Solver (ollama): model={args.solve_model} "
-                 f"top_n={args.solve_top} max_turns={args.solve_max_turns} "
-                 f"budget={args.solve_budget}")
+                _ctx_msf.msf_result = await msf_ingest.merge_msf_into_enrichment(
+                    enrichment_result, _ctx_msf.msf_client,
+                    _ctx_msf.msf_workspace or "default",
+                    accum=_ctx_msf.msf_result,
+                    log_cb=lambda ev, fields: _err(f"[msf] {ev} {fields}"),
+                )
+                r = _ctx_msf.msf_result
+                _err(f"[+] MSF merge: creds={r.pulled_creds} loot={r.pulled_loot} "
+                     f"notes={r.pulled_notes} vulns={r.pulled_vulns}")
+            except Exception as exc:
+                _err(f"⚠ msf merge failed: {type(exc).__name__}: {exc}")
+        s = enrichment_result.summary()
+        by_type = ", ".join(f"{k}:{v}" for k, v in sorted(s["users_by_type"].items())) or "—"
+        _err(f"Enrichment: {s['users']} identities ({by_type}), "
+             f"{s['oauth_apps']} oauth apps, {s['hosts']} hosts, "
+             f"{s['secrets']} secrets, {s['images_analyzed']} images analyzed, "
+             f"{s['unvisited_urls']} unvisited URLs")
+        # Loud password summary so the operator immediately sees crack rate
+        _err(f"  Passwords: {s['passwords_plaintext']} plaintext + "
+             f"{s['passwords_cracked']} cracked  →  "
+             f"{s['passwords_plaintext'] + s['passwords_cracked']} usable "
+             f"({s['passwords_uncracked']} hashes still uncracked)")
+        if s['passwords_plaintext'] + s['passwords_cracked'] > 0:
+            _err(f"  → see {s['out_dir']}/passwords.txt for the full <user>:<pass> list")
+        _err(f"  written to {s['out_dir']}/")
+        
+        # ── IDOR-driven data extraction ──────────────────────────────────────
+        # When IDORProbe confirmed cross-account reads, walk the affected
+        # endpoints with each available identity to pull per-victim records.
+        data_extract_result = None
+        if idor_result and (idor_result.confirmed or idor_result.likely):
+            from data_extractor import DataExtractor, AccountTokens
+            accounts: list[AccountTokens] = []
+            if account_a and account_a.headers:
+                accounts.append(AccountTokens(
+                    label=account_a.label, headers=dict(account_a.headers),
+                    username=account_a.username, email=account_a.email,
+                ))
+            if account_b and account_b.headers:
+                accounts.append(AccountTokens(
+                    label=account_b.label, headers=dict(account_b.headers),
+                    username=account_b.username, email=account_b.email,
+                ))
+            if accounts:
+                _err(f"[+] IDOR data extractor: pulling records for "
+                     f"{len(idor_result.confirmed) + len(idor_result.likely)} endpoints "
+                     f"with {len(accounts)} accounts")
+                data_extract_result = await DataExtractor(
+                    out_dir=str(out), timeout=args.timeout,
+                ).run(idor_result=idor_result, accounts=accounts)
+                _err(f"  pulled {data_extract_result.records_pulled} records "
+                     f"({data_extract_result.per_user_endpoints} per-user, "
+                     f"{data_extract_result.shared_endpoints} site-wide), "
+                     f"saved to {data_extract_result.out_dir}/")
+        
+        # ── File-upload bypass tests ─────────────────────────────────────────
+        # For any classified Cat.UPLOAD endpoint (or POST + multipart + path
+        # match), run the full bypass suite (magic-byte spoof, double-ext,
+        # Content-Type bypass, traversal, SVG-XSS, polyglot, oversize).
+        upload_probe_result = None
+        if not getattr(args, "no_upload_probe", False):
+            _ctx = getattr(args, "_ctx", None)
+            upload_probe_result = await UploadProbe(
+                out_dir=str(out), timeout=args.timeout, auth_headers=auth_hdrs,
+                payload_server=(_ctx.payload_server if _ctx else None),
+                public_url=(_ctx.public_url if _ctx else None),
+            ).run(result)
+            if upload_probe_result.endpoints_tested:
+                _err(f"Upload probe: {upload_probe_result.endpoints_tested} endpoints, "
+                     f"{upload_probe_result.tests_sent} tests sent, "
+                     f"{len(upload_probe_result.confirmed)} confirmed RCE/XSS, "
+                     f"{len(upload_probe_result.accepted)} accepted")
+                for f in upload_probe_result.confirmed[:5]:
+                    _err(f"  ✓ [{f.test_name}] {f.endpoint[:60]} — marker {f.execution_marker}")
+                (out / "upload_probe.json").write_text(
+                    json.dumps(upload_probe_result.to_dict(), indent=2)
+                )
+        
+        # ── SQL dump (when ActiveScanner confirmed SQLi) ─────────────────────
+        # Fingerprint dialect from confirmed SQLi response, replay UNION extraction
+        # to dump schema + interesting tables (users/accounts/sessions/orders).
+        # Cross-links any extracted user rows back into enrichment/users/<id>/db_rows/.
+        sql_dump_result = None
+        if active_result and not getattr(args, "no_sql_dump", False):
+            sql_dump_result = await SQLDumper(
+                out_dir=str(out), timeout=args.timeout, auth_headers=auth_hdrs,
+            ).run(active_result, enrichment_result=enrichment_result)
+            if sql_dump_result.fingerprints:
+                fp_str = ", ".join(f"{f.dialect}({f.confidence:.2f})"
+                                    for f in sql_dump_result.fingerprints)
+                _err(f"SQL dump: dialect={fp_str}, "
+                     f"{len(sql_dump_result.schema)} tables in schema, "
+                     f"{sql_dump_result.tables_dumped} dumped, "
+                     f"{sql_dump_result.rows_dumped} rows pulled")
+            elif sql_dump_result.notes:
+                for n in sql_dump_result.notes:
+                    _err(f"  SQL dump: {n}")
+            (out / "sql_dump.json").write_text(
+                json.dumps(sql_dump_result.to_dict(), indent=2)
+            )
+        
+        # ── LDAP/AD dump (when ActiveScanner / classifier surfaces LDAP injection) ──
+        # Vendor-fingerprint the directory (OpenLDAP / Active Directory / ApacheDS /
+        # OpenDJ), confirm boolean-blind injection at the param level, then extract
+        # high-value attributes (sAMAccountName, memberOf, userAccountControl, SPN,
+        # adminCount, LAPS, GMSA). AD UAC flags get parsed into named tags so
+        # KERBEROASTABLE / ASREPROASTABLE / DOMAIN_ADMIN / LAPS_READABLE surface
+        # directly in the report. Cross-links into enrichment/users/<id>/ldap/.
+        ldap_dump_result = None
+        if active_result and not getattr(args, "no_ldap_dump", False):
+            ldap_dump_result = await LDAPDumper(
+                out_dir=str(out), timeout=args.timeout, auth_headers=auth_hdrs,
+            ).run(active_result,
+                  classifier_findings=result.request_findings,
+                  enrichment_result=enrichment_result)
+            if ldap_dump_result.fingerprints:
+                fp_str = ", ".join(f"{f.vendor}({f.confidence:.2f})"
+                                    for f in ldap_dump_result.fingerprints)
+                _err(f"LDAP dump: vendor={fp_str}, "
+                     f"{len(ldap_dump_result.confirmed_injections)} confirmed injection(s), "
+                     f"{len(ldap_dump_result.accounts)} account(s) dumped, "
+                     f"{len(ldap_dump_result.high_value)} high-value tag(s)")
+            elif ldap_dump_result.notes:
+                for n in ldap_dump_result.notes:
+                    _err(f"  LDAP dump: {n}")
+            (out / "ldap_dump.json").write_text(
+                json.dumps(ldap_dump_result.to_dict(), indent=2)
+            )
+        
+        # ── LLM verification (opt-in) ────────────────────────────────────────
+        # Local Ollama LLM verifies "likely" heuristic findings — adds llm_verdict
+        # to each finding without overriding the heuristic. Cache is on disk so
+        # repeated scans don't re-spend tokens.
+        llm_verification_result = None
+        if getattr(args, "llm", False):
+            _err(f"[+] LLM verification: model={args.llm_model} host={args.llm_host} "
+                 f"budget={args.llm_budget}")
             async with LLMClient(
-                host=args.llm_host, model=args.solve_model,
-                cache_dir=str(out / "ollama_solver_cache"),
-                budget=args.solve_budget, timeout=120.0,
+                host=args.llm_host, model=args.llm_model,
+                cache_dir=str(out / "llm_cache"),
+                budget=args.llm_budget, timeout=60.0,
                 verbose=False,
             ) as llm:
                 if not await llm.is_alive():
-                    _err(f"  ✗ Ollama not reachable at {args.llm_host} — skipping")
+                    _err(f"  ✗ Ollama not reachable at {args.llm_host} — skipping LLM step")
                 else:
-                    solver_result = await solve_findings(
-                        llm_generate=llm.generate,
-                        model_name=args.solve_model,
-                        budget_stats=llm.stats,
-                        classifier_result=result,
-                        target=args.target,
-                        out_dir=out,
-                        auth_headers=auth_hdrs,
-                        storage_state_path=storage_state,
-                        top_n=args.solve_top,
-                        verbose=args.solve_verbose,
-                        public_url=(_ctx.public_url if _ctx else None),
-                        on_event=_solver_event,
-                    )
+                    verifier = LLMVerifier(llm)
+                    await verifier.verify_idor(idor_result, account_a, account_b)
+                    await verifier.verify_active_scan(active_result)
+                    await verifier.verify_auth_bypass(auth_bypass_result)
+                    llm_verification_result = verifier.result
                     s = llm.stats
-                    _err(f"  Ollama stats: {s.calls_made} calls, "
-                         f"{s.cache_hits} cache hits, {s.errors} errors, "
-                         f"avg {s.total_elapsed_ms / max(s.calls_made, 1):.0f}ms")
-                    _err(f"  Verdicts: {solver_result.confirmed} confirmed, "
-                         f"{solver_result.refuted} refuted, "
-                         f"{solver_result.inconclusive} inconclusive"
-                         + (f", ⚠ {solver_result.refusals} refusal(s)"
-                            if solver_result.refusals else ""))
-                    (out / "solver.json").write_text(
-                        json.dumps(solver_result.to_dict(), indent=2)
+                    _err(f"  LLM stats: {s.calls_made} calls, {s.cache_hits} cache hits, "
+                         f"{s.errors} errors, avg {s.total_elapsed_ms / max(s.calls_made, 1):.0f}ms")
+                    _err(f"  Verdicts: {verifier.result.promoted_to_confirmed} promoted, "
+                         f"{verifier.result.refuted} refuted, "
+                         f"{verifier.result.inconclusive} inconclusive")
+                    (out / "llm_verification.json").write_text(
+                        json.dumps(llm_verification_result.to_dict(), indent=2)
                     )
-        elif provider == "openai":
-            if not _servus_configured(_ctx):
-                _err(
-                    "[!] --solve requires servus — set SERVUS_AGENT_TOKEN "
-                    "(or [servus].agent_token_env in hxxpsin.toml); skipping"
-                )
-            else:
-                _err(f"[+] Solver (openai via servus): model={args.solve_model} "
+        
+        # ── Agentic solver (opt-in) ─────────────────────────────────────────
+        # Hand the top classifier findings to an LLM agent with http_request /
+        # browser_eval / read_finding / run_nuclei tools. Each finding gets a
+        # bounded turn budget; the agent returns a verdict + evidence per
+        # finding. Provider is selectable: 'claude' (Anthropic API, native
+        # tool-use) or 'ollama' (local model, ReAct JSON prompting).
+        solver_result = None
+        if getattr(args, "solve", False):
+            provider = (getattr(args, "solve_provider", "claude") or "claude").lower()
+            storage_state = args.auth or getattr(args, "auth_a", None)
+            # Pick model default based on provider when the user didn't specify
+            if not args.solve_model:
+                args.solve_model = {
+                    "ollama": "qwen2.5:7b",
+                    "openai": "gpt-5",
+                    "claude": "claude-opus-4-7",
+                }.get(provider, "claude-opus-4-7")
+        
+            # Forward solver events to the TUI so the LLM tab can show decisions live.
+            def _solver_event(kind, *evargs):
+                try:
+                    if kind == "solve_start" and len(evargs) >= 3:
+                        idx, method, url = evargs[0], evargs[1], evargs[2]
+                        _emit("llm_decision", {
+                            "stage": "start", "finding_index": idx,
+                            "method": method, "url": url,
+                            "model": args.solve_model, "provider": provider,
+                        })
+                    elif kind == "solve_done" and len(evargs) >= 3:
+                        idx, verdict, reason = evargs[0], evargs[1], evargs[2]
+                        _emit("llm_decision", {
+                            "stage": "verdict", "finding_index": idx,
+                            "verdict": verdict, "reason": reason,
+                            "model": args.solve_model, "provider": provider,
+                        })
+                except Exception:
+                    pass
+        
+            if provider == "ollama":
+                _err(f"[+] Solver (ollama): model={args.solve_model} "
                      f"top_n={args.solve_top} max_turns={args.solve_max_turns} "
                      f"budget={args.solve_budget}")
-                async with OpenAIClient(
-                    model=args.solve_model,
-                    cache_dir=str(out / "openai_cache"),
-                    budget=args.solve_budget,
-                    timeout=120.0,
-                    max_tokens=2048,
+                async with LLMClient(
+                    host=args.llm_host, model=args.solve_model,
+                    cache_dir=str(out / "ollama_solver_cache"),
+                    budget=args.solve_budget, timeout=120.0,
                     verbose=False,
-                ) as oa:
-                    if not await oa.is_alive():
-                        _err("  ✗ servus unreachable — skipping")
+                ) as llm:
+                    if not await llm.is_alive():
+                        _err(f"  ✗ Ollama not reachable at {args.llm_host} — skipping")
                     else:
                         solver_result = await solve_findings(
-                            llm_generate=oa.generate,
-                            model_name=oa.model,
-                            budget_stats=oa.stats,
+                            llm_generate=llm.generate,
+                            model_name=args.solve_model,
+                            budget_stats=llm.stats,
                             classifier_result=result,
                             target=args.target,
                             out_dir=out,
@@ -1901,10 +1701,10 @@ async def _finish_pipeline(
                             public_url=(_ctx.public_url if _ctx else None),
                             on_event=_solver_event,
                         )
-                        s = oa.stats
-                        _err(f"  OpenAI stats: {s.calls_made} calls, "
+                        s = llm.stats
+                        _err(f"  Ollama stats: {s.calls_made} calls, "
                              f"{s.cache_hits} cache hits, {s.errors} errors, "
-                             f"{s.total_input_tokens}in / {s.total_output_tokens}out tokens")
+                             f"avg {s.total_elapsed_ms / max(s.calls_made, 1):.0f}ms")
                         _err(f"  Verdicts: {solver_result.confirmed} confirmed, "
                              f"{solver_result.refuted} refuted, "
                              f"{solver_result.inconclusive} inconclusive"
@@ -1913,133 +1713,155 @@ async def _finish_pipeline(
                         (out / "solver.json").write_text(
                             json.dumps(solver_result.to_dict(), indent=2)
                         )
-        else:
-            if not _servus_configured(_ctx):
-                _err(
-                    "[!] --solve requires servus — set SERVUS_AGENT_TOKEN "
-                    "(or [servus].agent_token_env in hxxpsin.toml); skipping"
-                )
+            elif provider == "openai":
+                if not _servus_configured(_ctx):
+                    _err(
+                        "[!] --solve requires servus — set SERVUS_AGENT_TOKEN "
+                        "(or [servus].agent_token_env in hxxpsin.toml); skipping"
+                    )
+                else:
+                    _err(f"[+] Solver (openai via servus): model={args.solve_model} "
+                         f"top_n={args.solve_top} max_turns={args.solve_max_turns} "
+                         f"budget={args.solve_budget}")
+                    async with OpenAIClient(
+                        model=args.solve_model,
+                        cache_dir=str(out / "openai_cache"),
+                        budget=args.solve_budget,
+                        timeout=120.0,
+                        max_tokens=2048,
+                        verbose=False,
+                    ) as oa:
+                        if not await oa.is_alive():
+                            _err("  ✗ servus unreachable — skipping")
+                        else:
+                            solver_result = await solve_findings(
+                                llm_generate=oa.generate,
+                                model_name=oa.model,
+                                budget_stats=oa.stats,
+                                classifier_result=result,
+                                target=args.target,
+                                out_dir=out,
+                                auth_headers=auth_hdrs,
+                                storage_state_path=storage_state,
+                                top_n=args.solve_top,
+                                verbose=args.solve_verbose,
+                                public_url=(_ctx.public_url if _ctx else None),
+                                on_event=_solver_event,
+                            )
+                            s = oa.stats
+                            _err(f"  OpenAI stats: {s.calls_made} calls, "
+                                 f"{s.cache_hits} cache hits, {s.errors} errors, "
+                                 f"{s.total_input_tokens}in / {s.total_output_tokens}out tokens")
+                            _err(f"  Verdicts: {solver_result.confirmed} confirmed, "
+                                 f"{solver_result.refuted} refuted, "
+                                 f"{solver_result.inconclusive} inconclusive"
+                                 + (f", ⚠ {solver_result.refusals} refusal(s)"
+                                    if solver_result.refusals else ""))
+                            (out / "solver.json").write_text(
+                                json.dumps(solver_result.to_dict(), indent=2)
+                            )
             else:
-                _err(f"[+] Solver (claude via servus): model={args.solve_model} "
-                     f"top_n={args.solve_top} max_turns={args.solve_max_turns} "
-                     f"budget={args.solve_budget}")
-                async with ClaudeClient(
-                    model=args.solve_model,
-                    cache_dir=str(out / "claude_cache"),
-                    budget=args.solve_budget,
-                    timeout=120.0,
-                    max_tokens=2048,
-                    verbose=False,
-                ) as claude:
-                    if not await claude.is_alive():
-                        _err("  ✗ servus unreachable — skipping")
-                    else:
-                        solver_result = await solve_findings(
-                            llm_generate=claude.generate,
-                            model_name=claude.model,
-                            budget_stats=claude.stats,
-                            classifier_result=result,
-                            target=args.target,
-                            out_dir=out,
-                            auth_headers=auth_hdrs,
-                            storage_state_path=storage_state,
-                            top_n=args.solve_top,
-                            verbose=args.solve_verbose,
-                            public_url=(_ctx.public_url if _ctx else None),
-                            on_event=_solver_event,
-                        )
-                        s = claude.stats
-                        _err(f"  Claude stats: {s.calls_made} calls, "
-                             f"{s.cache_hits} cache hits, {s.errors} errors, "
-                             f"{s.total_input_tokens}in / {s.total_output_tokens}out tokens")
-                        _err(f"  Verdicts: {solver_result.confirmed} confirmed, "
-                             f"{solver_result.refuted} refuted, "
-                             f"{solver_result.inconclusive} inconclusive"
-                             + (f", ⚠ {solver_result.refusals} refusal(s)"
-                                if solver_result.refusals else ""))
-                        (out / "solver.json").write_text(
-                            json.dumps(solver_result.to_dict(), indent=2)
-                        )
-
-    # ── MSF push-back (opt-in via [msf].push_findings or --msf-push) ────
-    _ctx_push = getattr(args, "_ctx", None)
-    if (_ctx_push is not None and _ctx_push.msf_client is not None
-            and _ctx_push.config.msf.push_findings):
+                if not _servus_configured(_ctx):
+                    _err(
+                        "[!] --solve requires servus — set SERVUS_AGENT_TOKEN "
+                        "(or [servus].agent_token_env in hxxpsin.toml); skipping"
+                    )
+                else:
+                    _err(f"[+] Solver (claude via servus): model={args.solve_model} "
+                         f"top_n={args.solve_top} max_turns={args.solve_max_turns} "
+                         f"budget={args.solve_budget}")
+                    async with ClaudeClient(
+                        model=args.solve_model,
+                        cache_dir=str(out / "claude_cache"),
+                        budget=args.solve_budget,
+                        timeout=120.0,
+                        max_tokens=2048,
+                        verbose=False,
+                    ) as claude:
+                        if not await claude.is_alive():
+                            _err("  ✗ servus unreachable — skipping")
+                        else:
+                            solver_result = await solve_findings(
+                                llm_generate=claude.generate,
+                                model_name=claude.model,
+                                budget_stats=claude.stats,
+                                classifier_result=result,
+                                target=args.target,
+                                out_dir=out,
+                                auth_headers=auth_hdrs,
+                                storage_state_path=storage_state,
+                                top_n=args.solve_top,
+                                verbose=args.solve_verbose,
+                                public_url=(_ctx.public_url if _ctx else None),
+                                on_event=_solver_event,
+                            )
+                            s = claude.stats
+                            _err(f"  Claude stats: {s.calls_made} calls, "
+                                 f"{s.cache_hits} cache hits, {s.errors} errors, "
+                                 f"{s.total_input_tokens}in / {s.total_output_tokens}out tokens")
+                            _err(f"  Verdicts: {solver_result.confirmed} confirmed, "
+                                 f"{solver_result.refuted} refuted, "
+                                 f"{solver_result.inconclusive} inconclusive"
+                                 + (f", ⚠ {solver_result.refusals} refusal(s)"
+                                    if solver_result.refusals else ""))
+                            (out / "solver.json").write_text(
+                                json.dumps(solver_result.to_dict(), indent=2)
+                            )
+        
+        # ── MSF push-back (opt-in via [msf].push_findings or --msf-push) ────
+        _ctx_push = getattr(args, "_ctx", None)
+        if (_ctx_push is not None and _ctx_push.msf_client is not None
+                and _ctx_push.config.msf.push_findings):
+            try:
+                _ctx_push.msf_result = await msf_ingest.push_findings(
+                    _ctx_push.msf_client, args.target,
+                    result.request_findings,
+                    out_dir=out,
+                    min_score=_ctx_push.config.msf.push_min_score,
+                    accum=_ctx_push.msf_result,
+                    log_cb=lambda ev, fields: _err(f"[msf] {ev} {fields}"),
+                )
+                n_pushed = len(_ctx_push.msf_result.pushed_vulns)
+                if n_pushed:
+                    _err(f"[+] MSF push: {n_pushed} finding(s) recorded as vulns "
+                         f"in workspace={_ctx_push.msf_workspace}")
+            except Exception as exc:
+                _err(f"⚠ msf push failed: {type(exc).__name__}: {exc}")
+        
+        # ── MSF module suggestions (PR1/Bundle B — non-network, pure mapping) ──
+        if (_ctx_push is not None and _ctx_push.msf_client is not None
+                and getattr(_ctx_push.config.msf, "suggest_modules", True)):
+            if _ctx_push.msf_result is None:
+                _ctx_push.msf_result = msf_ingest.MSFIngestResult(
+                    backend=_ctx_push.msf_client.backend,
+                    workspace=_ctx_push.msf_workspace or "default",
+                )
+            for f in (result.request_findings or []):
+                url = getattr(f, "url", "") or ""
+                if not url:
+                    continue
+                hints = await msf_ingest.suggest_modules(_ctx_push.msf_client, f)
+                if hints:
+                    _ctx_push.msf_result.suggested_modules[url] = hints
+        
+    except Exception as exc:
+        _err(f"⚠ pipeline post-phase error: {type(exc).__name__}: {exc}")
+    finally:
+        ps.challenge_diff = challenge_diff
+        ps.enrichment_result = enrichment_result
+        ps.data_extract_result = data_extract_result
+        ps.upload_probe_result = upload_probe_result
+        ps.sql_dump_result = sql_dump_result
+        ps.ldap_dump_result = ldap_dump_result
+        ps.llm_verification_result = llm_verification_result
+        ps.solver_result = solver_result
         try:
-            _ctx_push.msf_result = await msf_ingest.push_findings(
-                _ctx_push.msf_client, args.target,
-                result.request_findings,
-                out_dir=out,
-                min_score=_ctx_push.config.msf.push_min_score,
-                accum=_ctx_push.msf_result,
-                log_cb=lambda ev, fields: _err(f"[msf] {ev} {fields}"),
+            md_path, json_path = await _write_pipeline_report(
+                args, ps, profile, col, out, start, offset, total_steps,
+                har_result=har_result, scm_probe_result=scm_probe_result,
             )
-            n_pushed = len(_ctx_push.msf_result.pushed_vulns)
-            if n_pushed:
-                _err(f"[+] MSF push: {n_pushed} finding(s) recorded as vulns "
-                     f"in workspace={_ctx_push.msf_workspace}")
         except Exception as exc:
-            _err(f"⚠ msf push failed: {type(exc).__name__}: {exc}")
-
-    # ── MSF module suggestions (PR1/Bundle B — non-network, pure mapping) ──
-    if (_ctx_push is not None and _ctx_push.msf_client is not None
-            and getattr(_ctx_push.config.msf, "suggest_modules", True)):
-        if _ctx_push.msf_result is None:
-            _ctx_push.msf_result = msf_ingest.MSFIngestResult(
-                backend=_ctx_push.msf_client.backend,
-                workspace=_ctx_push.msf_workspace or "default",
-            )
-        for f in (result.request_findings or []):
-            url = getattr(f, "url", "") or ""
-            if not url:
-                continue
-            hints = await msf_ingest.suggest_modules(_ctx_push.msf_client, f)
-            if hints:
-                _ctx_push.msf_result.suggested_modules[url] = hints
-
-    # ── report ────────────────────────────────────────────────────────────
-    _step(offset + 11, total_steps, "Writing report")
-    _ctx = getattr(args, "_ctx", None)
-    _tunnel_hits = list(_ctx.payload_server.hits) if (_ctx and _ctx.payload_server) else []
-    _tunnel_info = _ctx.to_dict() if _ctx else {}
-    _msf_ingest_obj = _ctx.msf_result if (_ctx and _ctx.msf_result) else None
-    reporter = Reporter(
-        result,
-        target=args.target,
-        profile=profile,
-        desync=desync_result,
-        jwt=jwt_result,
-        params=param_result,
-        active_scan=active_result,
-        redirect=redirect_result,
-        crlf=crlf_result,
-        nosql=nosql_result,
-        sql_probe=sql_probe_result,
-        auto_auth=auto_auth_session,
-        auth_bypass=auth_bypass_result,
-        challenges=challenge_diff,
-        idor=idor_result,
-        dom_xss=dom_xss_result,
-        files=grabber_result,
-        har=har_result,
-        access_replay=access_replay_result,
-        enrichment=enrichment_result,
-        data_extract=data_extract_result,
-        llm_verification=llm_verification_result,
-        solver=solver_result,
-        upload_probe=upload_probe_result,
-        sql_dump=sql_dump_result,
-        ldap_dump=ldap_dump_result,
-        scm_probe=scm_probe_result,
-        ws_probe=ws_probe_result,
-        ct_probe=ct_probe_result,
-        auto_fuzz=auto_fuzz_result,
-        tunnel_hits=_tunnel_hits,
-        tunnel_info=_tunnel_info,
-        msf_ingest=_msf_ingest_obj,
-    )
-    md_path, json_path = reporter.write(str(out))
-
+            _err(f"⚠ report write failed: {type(exc).__name__}: {exc}")
     # Close canary
     if canary:
         await canary.close()
@@ -2457,6 +2279,14 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Auto-place §markers§ on all discovered parameters and run Intruder payload "
                            "sets (IDOR→ids, Injection→sqli/xss/ssti, SSRF→redirects). "
                            "Faster than --active-scan; reports anomalies by status/length delta.")
+    scan.add_argument("--resume", metavar="OUT_DIR", default=None,
+                      help="Resume a prior scan: skip stages already in OUT_DIR/stages/*.json")
+    scan.add_argument("--desync-confirm", action="store_true",
+                      help="Run safe CL.TE/TE.CL differential smuggling confirmation (opt-in)")
+    scan.add_argument("--adaptive-plan", action="store_true",
+                      help="Use servus LLM to prioritize probe stages (requires SERVUS_AGENT_TOKEN)")
+    scan.add_argument("--stage-concurrency", type=int, default=6, metavar="N",
+                      help="Max concurrent pipeline stages (default: 6)")
     scan.add_argument("--oob", metavar="MODE", nargs="?", const="interactsh",
                       help="Enable OOB callbacks. MODE: 'interactsh' (default) or custom OOB domain.")
     scan.add_argument("--no-param-mine", action="store_true",

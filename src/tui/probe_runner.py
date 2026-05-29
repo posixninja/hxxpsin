@@ -307,6 +307,54 @@ async def run_dns_recon(req: dict) -> list[dict]:
     return findings
 
 
+async def run_graphql(req: dict) -> list[dict]:
+    _ensure_src_path()
+    from graphql_probe import GraphQLProbe
+    from urllib.parse import urlparse
+
+    url = req.get("url", "")
+    if not url:
+        return []
+    parsed = urlparse(url)
+    target = f"{parsed.scheme}://{parsed.netloc}"
+    auth = req.get("headers") or {}
+    result = await GraphQLProbe(auth_headers=auth, timeout=8.0).run(target, [url])
+    return [f.to_dict() for f in result.confirmed + result.likely]
+
+
+async def run_race(req: dict) -> list[dict]:
+    _ensure_src_path()
+    from race_probe import RaceProbe
+    from classifier import ClassifierResult
+
+    finding = _req_to_finding(req)
+    cr = ClassifierResult(
+        request_findings=[finding],
+        websocket_findings=[],
+        js_route_findings=[],
+        js_constants=[],
+        by_category={},
+    )
+    auth = req.get("headers") or {}
+    result = await RaceProbe(auth_headers=auth, timeout=8.0).run(cr)
+    return [f.to_dict() for f in result.confirmed + result.likely]
+
+
+async def run_oauth(req: dict) -> list[dict]:
+    _ensure_src_path()
+    from oauth_probe import OAuthProbe
+    from urllib.parse import urlparse
+
+    url = req.get("url", "")
+    if not url:
+        return []
+    parsed = urlparse(url)
+    target = f"{parsed.scheme}://{parsed.netloc}"
+    auth = req.get("headers") or {}
+    result = await OAuthProbe(auth_headers=auth, timeout=8.0).run(target, [url])
+    return [f.to_dict() for f in result.confirmed + result.likely]
+
+
 RUNNERS: dict[str, Any] = {
     "crlf":          run_crlf,
     "jwt":           run_jwt,
@@ -315,4 +363,7 @@ RUNNERS: dict[str, Any] = {
     "fingerprint":   run_fingerprint,
     "access_replay": run_access_replay,
     "dns_recon":     run_dns_recon,
+    "graphql":       run_graphql,
+    "race":          run_race,
+    "oauth":         run_oauth,
 }

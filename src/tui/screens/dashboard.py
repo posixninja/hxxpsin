@@ -295,6 +295,10 @@ class DashboardScreen(Vertical):
             tag = hit.get("tag", "?")
             addr = hit.get("remote_address", "?")
             lines.append(f"[red][DNS][/red] {tag} @ {addr}")
+        for name, st in sorted(state.stage_status.items())[-12:]:
+            status = st.get("status", "?")
+            ms = st.get("elapsed_ms", 0)
+            lines.append(f"[cyan][stage][/cyan] {name}: {status} ({ms:.0f}ms)")
         for trig in state.challenge_triggers[-15:]:
             name = trig.get("name", "?")
             lines.append(f"[yellow][CHAL][/yellow] {name}")

@@ -24,6 +24,9 @@ _PROBE_TABS = [
     ("dns_recon",    "DNS Recon",    ["url", "category", "verdict"]),
     ("ws",           "WebSocket",    ["url", "category", "severity"]),
     ("auto_fuzz",    "AutoFuzz",     ["url", "position", "payload", "anomaly"]),
+    ("graphql",      "GraphQL",      ["test", "url", "severity", "evidence"]),
+    ("race",         "Race",         ["method", "url", "evidence", "responses_differ"]),
+    ("oauth",        "OAuth",        ["test", "url", "severity", "evidence"]),
 ]
 
 _STATUS_ICONS = {
